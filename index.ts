@@ -1279,7 +1279,9 @@ print(json.dumps(out))
 
 	function hostTag(theme: any): string {
 		const t = target;
-		return t ? theme.fg("muted", `[${t.remote}]`) : "";
+		// `success` (green) so the host badge is clearly visible across themes — `muted`
+		renders too close to the default foreground in many themes. Reads as the live remote.
+		return t ? theme.fg("success", `[${t.remote}]`) : "";
 	}
 
 	// Build the one-line tool-call title, reusing the prior Text component.
