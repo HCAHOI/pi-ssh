@@ -9,13 +9,19 @@
  *   /ssh user@host                                      # use remote pwd as cwd
  *   /ssh user@host:/remote/path                         # explicit remote cwd
  *   /ssh -i /path/to/key.pem root@host                  # identity file / ssh options
+ *   /ssh -i key root@host:/path --activate 'source .venv/bin/activate'
+ *   /ssh root@host --env PYTHONPATH=/src --env CUDA_VISIBLE_DEVICES=0
  *   /ssh off                                           # disconnect
  *   /ssh                                               # show current status
+ *
+ * --activate <cmd> and --env KEY=VALUE (repeatable) attach a persistent shell
+ * prefix / environment that is applied to EVERY ssh_bash and ssh_process run,
+ * so you do not have to re-source a venv or re-export vars on each call.
  *
  * Agents can also call ssh_connect/ssh_disconnect/ssh_status directly.
  *
  * Or at startup:
- *   pi -e ./ssh.ts --ssh "-i /path/to/key.pem root@host[:/path]"
+ *   pi -e ./ssh/index.ts --ssh "-i /path/to/key.pem root@host[:/path]"
  *
  * Enhancements over the bundled example:
  *   1. SSH connection reuse via OpenSSH ControlMaster multiplexing — all
@@ -24,6 +30,10 @@
  *   2. Real remote in-place edit — oldText/newText are shipped to the remote
  *      and applied by python3 there; only the diff comes back. Falls back to
  *      read-rewrite-write when python3 is unavailable on the remote.
+ *   3. Persistent per-connection activation/env (--activate / --env) applied
+ *      to ssh_bash and ssh_process so venv/env setup is not repeated.
+ *   4. Background remote processes (ssh_process) capture their exit code and
+ *      support a clear action to prune finished jobs.
  *
  * Requirements:
  *   - SSH key-based auth (BatchMode=yes; no password prompts)
@@ -62,6 +72,15 @@ interface SshTarget {
 	socket: string;
 	hasPython: boolean;
 	sshOptions: string[];
+	/** Shell prefix applied before every ssh_bash / ssh_process command (e.g. venv activation). */
+	defaultCommandPrefix?: string;
+	/** Environment exported before every ssh_bash / ssh_process command. */
+	defaultEnv?: Record<string, string>;
+}
+
+interface Activation {
+	commandPrefix?: string;
+	env?: Record<string, string>;
 }
 
 interface RunResult {
@@ -518,12 +537,20 @@ async function remotePatchEdit(
 // Connection management
 // ---------------------------------------------------------------------------
 
-async function resolveTarget(remote: string, path?: string, sshOptions: string[] = []): Promise<SshTarget> {
+async function resolveTarget(remote: string, path?: string, sshOptions: string[] = [], activation?: Activation): Promise<SshTarget> {
 	const socket = join(tmpdir(), `pi-ssh-${randomBytes(4).toString("hex")}.sock`);
 	const remoteCwd = path
 		? (await sshExecRaw(socket, remote, sshOptions, `cd -- ${shQuote(path)} && pwd -P`)).toString().trim()
 		: (await sshExecRaw(socket, remote, sshOptions, "pwd -P")).toString().trim();
-	const t: SshTarget = { remote, remoteCwd, socket, hasPython: false, sshOptions };
+	const t: SshTarget = {
+		remote,
+		remoteCwd,
+		socket,
+		hasPython: false,
+		sshOptions,
+		defaultCommandPrefix: activation?.commandPrefix?.trim() || undefined,
+		defaultEnv: activation?.env && Object.keys(activation.env).length ? activation.env : undefined,
+	};
 	t.hasPython = await probePython(t);
 	return t;
 }
@@ -548,7 +575,7 @@ async function sshExecRaw(socket: string, remote: string, sshOptions: string[], 
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
-	pi.registerFlag("ssh", { description: "SSH remote, e.g. user@host[:/path] or -i key user@host", type: "string" });
+	pi.registerFlag("ssh", { description: "SSH remote, e.g. user@host[:/path], -i key user@host, optionally with --activate <cmd> / --env K=V", type: "string" });
 
 	const localCwd = process.cwd();
 	const localRead = createReadTool(localCwd);
@@ -563,7 +590,9 @@ export default function (pi: ExtensionAPI) {
 	const get = () => target;
 
 	function statusLabel(t: SshTarget | null): string {
-		return t ? `SSH: ${t.remote}:${t.remoteCwd}${t.hasPython ? "" : " (no python3)"}` : "";
+		if (!t) return "";
+		const act = t.defaultCommandPrefix ? ` ⚡${t.defaultCommandPrefix.length > 28 ? `${t.defaultCommandPrefix.slice(0, 27)}…` : t.defaultCommandPrefix}` : "";
+		return `SSH: ${t.remote}:${t.remoteCwd}${t.hasPython ? "" : " (no python3)"}${act}`;
 	}
 
 	function refreshStatus(ctx: any) {
@@ -606,26 +635,57 @@ export default function (pi: ExtensionAPI) {
 		return tokens;
 	}
 
-	function parseConnectArg(arg: string): { remote: string; path?: string; sshOptions: string[] } {
+	function parseConnectArg(arg: string): { remote: string; path?: string; sshOptions: string[]; activation: Activation } {
 		const tokens = tokenizeSshArgs(arg);
 		if (tokens[0] === "ssh") tokens.shift();
 		if (tokens.length === 0) throw new Error("Missing SSH destination");
-		const destination = tokens[tokens.length - 1];
-		const sshOptions = tokens.slice(0, -1);
+
+		// Extract our own --activate / --env flags before treating the rest as ssh
+		// options + destination. Values may be attached (--env=K=V) or separate.
+		let commandPrefix: string | undefined;
+		const env: Record<string, string> = {};
+		const rest: string[] = [];
+		for (let i = 0; i < tokens.length; i++) {
+			const tk = tokens[i];
+			if (tk === "--activate") {
+				commandPrefix = tokens[++i];
+				if (commandPrefix === undefined) throw new Error("--activate requires a command, e.g. --activate 'source .venv/bin/activate'");
+				continue;
+			}
+			if (tk.startsWith("--activate=")) {
+				commandPrefix = tk.slice("--activate=".length);
+				continue;
+			}
+			if (tk === "--env" || tk.startsWith("--env=")) {
+				const kv = tk.startsWith("--env=") ? tk.slice("--env=".length) : tokens[++i];
+				if (kv === undefined) throw new Error("--env requires KEY=VALUE");
+				const eq = kv.indexOf("=");
+				if (eq <= 0) throw new Error(`--env expects KEY=VALUE, got: ${kv}`);
+				const key = kv.slice(0, eq);
+				if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw new Error(`Invalid env var name: ${key}`);
+				env[key] = kv.slice(eq + 1);
+				continue;
+			}
+			rest.push(tk);
+		}
+		if (rest.length === 0) throw new Error("Missing SSH destination");
+		const destination = rest[rest.length - 1];
+		const sshOptions = rest.slice(0, -1);
+		const activation: Activation = { commandPrefix, env: Object.keys(env).length ? env : undefined };
 		const homePath = destination.match(/^(.+):(~(?:\/.*)?)$/);
 		if (homePath) {
 			throw new Error("SSH remote cwd must be an absolute path; use /ssh -i key user@host:/absolute/path");
 		}
 		const match = destination.match(/^(.+):(\/.*)$/);
 		if (!match) {
-			return { remote: destination, sshOptions };
+			return { remote: destination, sshOptions, activation };
 		}
-		return { remote: match[1], path: match[2], sshOptions };
+		return { remote: match[1], path: match[2], sshOptions, activation };
 	}
 
 	async function connect(arg: string): Promise<SshTarget> {
-		const { remote, path, sshOptions } = parseConnectArg(arg);
-		return resolveTarget(remote, path, sshOptions);
+		const { remote, path, sshOptions, activation } = parseConnectArg(arg);
+		return resolveTarget(remote, path, sshOptions, activation);
 	}
 
 	async function switchTarget(arg: string): Promise<SshTarget> {
@@ -648,7 +708,10 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function connectedText(t: SshTarget): string {
-		return `SSH connected: ${t.remote}:${t.remoteCwd}${t.hasPython ? "" : " (no python3; ssh_edit uses fallback)"}`;
+		const lines = [`SSH connected: ${t.remote}:${t.remoteCwd}${t.hasPython ? "" : " (no python3; ssh_edit uses fallback)"}`];
+		if (t.defaultCommandPrefix) lines.push(`  activation (every ssh_bash/ssh_process): ${t.defaultCommandPrefix}`);
+		if (t.defaultEnv && Object.keys(t.defaultEnv).length) lines.push(`  env: ${Object.keys(t.defaultEnv).join(", ")}`);
+		return lines.join("\n");
 	}
 
 	function buildEnvExports(env: Record<string, string> | undefined): string[] {
@@ -669,8 +732,9 @@ export default function (pi: ExtensionAPI) {
 		commandPrefix?: string;
 	}): string {
 		const parts: string[] = [];
-		parts.push(...buildEnvExports(params.env));
+		parts.push(...buildEnvExports({ ...t.defaultEnv, ...params.env }));
 		if (params.cwd?.trim()) parts.push(`cd -- ${shQuote(toRemotePath(params.cwd, localCwd, t.remoteCwd))}`);
+		if (t.defaultCommandPrefix?.trim()) parts.push(t.defaultCommandPrefix);
 		if (params.commandPrefix?.trim()) parts.push(params.commandPrefix);
 		if (params.delaySeconds !== undefined) {
 			if (!Number.isFinite(params.delaySeconds) || params.delaySeconds < 0) {
@@ -686,14 +750,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "ssh_connect",
 		label: "ssh_connect",
-		description: "Connect, reconnect, or switch the active SSH remote for ssh_* tools. Accepts the same target syntax as /ssh, e.g. '-i /path/key.pem root@host[:/absolute/path]'. Local tools remain local.",
+		description: "Connect, reconnect, or switch the active SSH remote for ssh_* tools. Accepts the same target syntax as /ssh, e.g. '-i /path/key.pem root@host[:/absolute/path]'. Optional '--activate <cmd>' sets a shell prefix (e.g. venv activation) and repeatable '--env KEY=VALUE' sets environment, both applied to every ssh_bash and ssh_process. Local tools remain local.",
 		promptSnippet: "Connect or switch the active SSH remote used by ssh_* tools",
 		promptGuidelines: [
 			"Use ssh_connect when the user asks to connect, disconnect, or switch SSH servers from within the agent session.",
 			"After ssh_connect succeeds, use ssh_bash/ssh_read/ssh_write/ssh_edit for remote operations; keep read/write/edit/bash for local work.",
 		],
 		parameters: Type.Object({
-			target: Type.String({ description: "SSH target, e.g. '-i /path/key.pem root@host' or 'user@host:/absolute/path'" }),
+			target: Type.String({ description: "SSH target, e.g. '-i /path/key.pem root@host', 'user@host:/absolute/path', or with persistent setup: 'root@host:/work --activate \"source .venv/bin/activate\" --env PYTHONPATH=/src'" }),
 		}),
 		async execute(_id, params: { target: string }, _signal, _onUpdate, ctx) {
 			const next = await switchTarget(params.target);
@@ -894,8 +958,18 @@ export default function (pi: ExtensionAPI) {
 		commandPrefix?: string;
 	}): string {
 		const cwd = params.cwd?.trim() ? toRemotePath(params.cwd, localCwd, t.remoteCwd) : t.remoteCwd;
-		const lines = ["#!/usr/bin/env bash", `cd -- ${shQuote(cwd)}`];
-		lines.push(...buildEnvExports(params.env));
+		const lines = [
+			"#!/usr/bin/env bash",
+			// Resolve the process dir (where run.sh lives) so we can record the exit code there.
+			`__pi_dir="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"`,
+			// Record the final exit status on ANY exit (normal end, explicit `exit N`,
+			// or error under set -e). A trailing capture line would be skipped whenever
+			// the command itself calls exit, so an EXIT trap is the robust choice.
+			`trap '__pi_rc=$?; printf %s "$__pi_rc" > "$__pi_dir/exit_code"' EXIT`,
+			`cd -- ${shQuote(cwd)}`,
+		];
+		lines.push(...buildEnvExports({ ...t.defaultEnv, ...params.env }));
+		if (t.defaultCommandPrefix?.trim()) lines.push(t.defaultCommandPrefix);
 		if (params.commandPrefix?.trim()) lines.push(params.commandPrefix);
 		lines.push(params.command);
 		return `${lines.join("\n")}\n`;
@@ -936,14 +1010,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "ssh_process",
 		label: "ssh_process",
-		description: "Manage long-running processes on the active SSH remote. Starts commands in the background with logs under remote .pi-ssh-processes/<id>/; supports start/list/output/logs/kill.",
+		description: "Manage long-running processes on the active SSH remote. Starts commands in the background with logs under remote .pi-ssh-processes/<id>/; supports start/list/output/logs/kill/clear. list and output report the captured exit code once a job finishes; clear prunes finished jobs.",
 		promptSnippet: "Manage long-running remote SSH processes",
 		promptGuidelines: [
 			"Use ssh_process start for long-running remote jobs such as training, dev servers, and log tails instead of blocking ssh_bash.",
 			"Use ssh_process output to inspect recent stdout/stderr and ssh_process kill to stop remote jobs.",
 		],
 		parameters: Type.Object({
-			action: Type.Union([Type.Literal("start"), Type.Literal("list"), Type.Literal("output"), Type.Literal("logs"), Type.Literal("kill")]),
+			action: Type.Union([Type.Literal("start"), Type.Literal("list"), Type.Literal("output"), Type.Literal("logs"), Type.Literal("kill"), Type.Literal("clear")]),
 			name: Type.Optional(Type.String({ description: "Friendly process name for start" })),
 			command: Type.Optional(Type.String({ description: "Command to start on the remote" })),
 			id: Type.Optional(Type.String({ description: "Remote process id returned by start/list" })),
@@ -953,7 +1027,7 @@ export default function (pi: ExtensionAPI) {
 			lines: Type.Optional(Type.Number({ description: "Number of recent log lines for output (default 80)" })),
 		}),
 		async execute(_id, params: {
-			action: "start" | "list" | "output" | "logs" | "kill";
+			action: "start" | "list" | "output" | "logs" | "kill" | "clear";
 			name?: string;
 			command?: string;
 			id?: string;
@@ -976,7 +1050,10 @@ export default function (pi: ExtensionAPI) {
 					`printf %s ${shQuote(params.command)} > ${shQuote(`${dir}/command`)}`,
 					`cat > ${shQuote(`${dir}/run.sh`)}`,
 					`chmod +x ${shQuote(`${dir}/run.sh`)}`,
-					`nohup setsid bash ${shQuote(`${dir}/run.sh`)} > ${shQuote(`${dir}/stdout.log`)} 2> ${shQuote(`${dir}/stderr.log`)} < /dev/null & echo $! > ${shQuote(`${dir}/pid`)}`,
+					// Group with { ...; } so `&` backgrounds only nohup; echo $! then captures
+					// ITS pid. Without the braces, `&` would background the whole `&&` setup
+					// chain and `echo $! > pid` would run before mkdir created the dir.
+					`{ nohup setsid bash ${shQuote(`${dir}/run.sh`)} > ${shQuote(`${dir}/stdout.log`)} 2> ${shQuote(`${dir}/stderr.log`)} < /dev/null & echo $! > ${shQuote(`${dir}/pid`)}; }`,
 					`printf %s ${shQuote(procId)}`,
 				].join(" && ");
 				const r = await runRemoteCommand(t, cmd, { stdin: script, signal });
@@ -985,11 +1062,18 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.action === "list") {
-				const cmd = `root=${shQuote(root)}; if [ ! -d "$root" ]; then exit 0; fi; for d in "$root"/*; do [ -d "$d" ] || continue; id=$(basename "$d"); pid=$(cat "$d/pid" 2>/dev/null || true); name=$(cat "$d/name" 2>/dev/null || true); if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then status=running; else status=exited; fi; printf '%s\t%s\t%s\t%s\n' "$id" "$status" "$pid" "$name"; done`;
+				const cmd = `root=${shQuote(root)}; if [ ! -d "$root" ]; then echo 'No remote processes.'; exit 0; fi; found=0; for d in "$root"/*; do [ -d "$d" ] || continue; found=1; id=$(basename "$d"); pid=$(cat "$d/pid" 2>/dev/null || true); name=$(cat "$d/name" 2>/dev/null || true); if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then status=running; code='-'; else status=exited; code=$(cat "$d/exit_code" 2>/dev/null || true); [ -n "$code" ] || code='?'; fi; printf '%s\t%s\texit=%s\tpid=%s\t%s\n' "$id" "$status" "$code" "$pid" "$name"; done; [ "$found" -eq 0 ] && echo 'No remote processes.' || true`;
 				const r = await runRemoteCommand(t, cmd, { signal });
 				if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
 				const text = r.stdout.toString().trim() || "No remote processes.";
 				return { content: [{ type: "text" as const, text }] };
+			}
+
+			if (params.action === "clear") {
+				const cmd = `root=${shQuote(root)}; if [ ! -d "$root" ]; then echo 'No remote processes.'; exit 0; fi; removed=0; kept=0; for d in "$root"/*; do [ -d "$d" ] || continue; pid=$(cat "$d/pid" 2>/dev/null || true); if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then kept=$((kept+1)); continue; fi; rm -rf "$d" && removed=$((removed+1)); done; rmdir "$root" 2>/dev/null || true; printf 'Cleared %s finished process(es); %s still running.\n' "$removed" "$kept"`;
+				const r = await runRemoteCommand(t, cmd, { signal });
+				if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
+				return { content: [{ type: "text" as const, text: r.stdout.toString().trim() }] };
 			}
 
 			if (!params.id?.trim()) throw new Error(`ssh_process ${params.action} requires id`);
@@ -997,7 +1081,7 @@ export default function (pi: ExtensionAPI) {
 
 			if (params.action === "output") {
 				const lines = Math.max(1, Math.floor(params.lines ?? 80));
-				const cmd = `d=${shQuote(dir)}; test -d "$d" || { echo 'process not found' >&2; exit 2; }; echo '--- stdout ---'; tail -n ${lines} "$d/stdout.log" 2>/dev/null || true; echo '--- stderr ---'; tail -n ${lines} "$d/stderr.log" 2>/dev/null || true`;
+				const cmd = `d=${shQuote(dir)}; test -d "$d" || { echo 'process not found' >&2; exit 2; }; echo '--- stdout ---'; tail -n ${lines} "$d/stdout.log" 2>/dev/null || true; echo '--- stderr ---'; tail -n ${lines} "$d/stderr.log" 2>/dev/null || true; pid=$(cat "$d/pid" 2>/dev/null || true); if [ -f "$d/exit_code" ]; then echo "--- exited, code: $(cat "$d/exit_code") ---"; elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo "--- still running (pid $pid) ---"; else echo '--- exited (no exit code recorded) ---'; fi`;
 				const r = await runRemoteCommand(t, cmd, { signal });
 				if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
 				return { content: [{ type: "text" as const, text: r.stdout.toString() || "(no output)" }] };
@@ -1030,7 +1114,7 @@ export default function (pi: ExtensionAPI) {
 			const t = requireTarget();
 			const localSource = ensureTrailingSlash(resolve(localCwd, params.localPath ?? "."));
 			const remoteDest = ensureTrailingSlash(params.remotePath ? toRemotePath(params.remotePath, localCwd, t.remoteCwd) : t.remoteCwd);
-			const args = ["-az", "--filter=:- .gitignore", "--exclude", ".git/", "-e", rsyncSshCommand(t)];
+			const args = ["-az", "--itemize-changes", "--human-readable", "--stats", "--filter=:- .gitignore", "--exclude", ".git/", "-e", rsyncSshCommand(t)];
 			for (const exclude of params.excludes ?? []) args.push("--exclude", exclude);
 			if (params.delete) args.push("--delete");
 			args.push(localSource, `${t.remote}:${remoteDest}`);
@@ -1055,7 +1139,7 @@ export default function (pi: ExtensionAPI) {
 			const t = requireTarget();
 			const remoteSource = ensureTrailingSlash(params.remotePath ? toRemotePath(params.remotePath, localCwd, t.remoteCwd) : t.remoteCwd);
 			const localDest = ensureTrailingSlash(resolve(localCwd, params.localPath ?? "."));
-			const args = ["-az", "-e", rsyncSshCommand(t)];
+			const args = ["-az", "--itemize-changes", "--human-readable", "--stats", "-e", rsyncSshCommand(t)];
 			for (const exclude of params.excludes ?? []) args.push("--exclude", exclude);
 			if (params.delete) args.push("--delete");
 			args.push(`${t.remote}:${remoteSource}`, localDest);
@@ -1096,7 +1180,7 @@ export default function (pi: ExtensionAPI) {
 
 	// --- runtime connect/disconnect/status ---
 	pi.registerCommand("ssh", {
-		description: "SSH remote: /ssh [-i key] user@host[:/path] | /ssh off | /ssh",
+		description: "SSH remote: /ssh [-i key] user@host[:/path] [--activate <cmd>] [--env K=V] | /ssh off | /ssh",
 		handler: async (args, ctx) => {
 			const arg = args.trim();
 
