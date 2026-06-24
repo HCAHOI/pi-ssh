@@ -1607,7 +1607,10 @@ print(json.dumps(out))
 		}),
 		renderCall(args: any, theme: any, context: any) {
 			const cmd = str(args?.command);
-			const body = cmd ? theme.fg("toolTitle", theme.bold(`$ ${cmd}`)) : theme.fg("toolOutput", "$ ...");
+			// `$` bold in the default text color; command in green (success), not bold —
+			// matches the bashMode tool-display where executed commands render green.
+			const dollar = theme.fg("toolTitle", theme.bold("$"));
+			const body = cmd ? `${dollar} ${theme.fg("success", cmd)}` : `${dollar} ${theme.fg("toolOutput", "...")}`;
 			const timeout = args?.timeout ? theme.fg("muted", ` (timeout ${args.timeout}s)`) : "";
 			return sshTitle("", `${body}${timeout}`, theme, context);
 		},
