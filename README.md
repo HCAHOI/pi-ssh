@@ -1,6 +1,8 @@
 # SSH Remote Execution Extension
 
-Edit locally, test/run remotely. Adds `ssh_*` tools (read/write/edit/grep/find/ls/bash/process/push/pull) that operate on an active SSH remote while the built-in `read`/`write`/`edit`/`bash` stay local.
+Edit locally, test/run remotely. Adds `ssh_*` tools
+(read/write/edit/grep/find/ls/bash/process/push/pull/sync/tunnel) that operate on
+an active SSH remote while the built-in `read`/`write`/`edit`/`bash` stay local.
 
 ## Connect
 
@@ -8,6 +10,7 @@ Edit locally, test/run remotely. Adds `ssh_*` tools (read/write/edit/grep/find/l
 /ssh -i /path/key.pem root@host:/abs/work        # connect, set remote cwd
 /ssh root@host                                    # use remote pwd as cwd
 /ssh cd subdir/or/abs/path                        # move remote cwd (no reconnect)
+/ssh profiles                                     # list saved profiles
 /ssh off                                          # disconnect
 /ssh                                              # status
 ```
@@ -56,13 +59,53 @@ The remote job itself runs via `nohup setsid`, so it keeps running regardless of
 the local machine. **Mac sleep is safe:** the poller is a local timer that simply
 pauses while asleep and, on wake, sweeps the remote logs from byte offsets — no
 completion or matching log line is lost, only the notification is delayed until
-wake. If pi exits entirely, the job still runs; reconnect and `ssh_process list`.
+wake.
+
+**Reconnect / pi-restart safe:** each job persists its notification config to
+`notify.json` in the job dir. On every (re)connect — including `ssh_connect`
+switching and a full pi restart — pollers are re-armed from disk
+(`rehydratePollers`): a finished, un-notified job fires its missed completion
+once (guarded by a `notified` marker), and still-running jobs resume watching
+from the current log EOF. Reconnecting to the **same** host keeps the in-memory
+pollers intact. Use `ssh_process attach <id>` to manually (re)arm notifications
+for a job started earlier.
+
+### Live follow
+
+`ssh_process output` accepts `followSeconds: N` to stream new stdout/stderr lines
+live for N seconds (remote `timeout … tail -F`) before returning the snapshot —
+better than re-polling `output` to watch progress.
 
 ## Transfer (`ssh_push` / `ssh_pull`)
 
 rsync over the shared connection. `ssh_push` is `.gitignore`-filtered. Both
-stream live `--info=progress2` output and accept `dryRun: true` to preview a
-transfer (handy before pushing a large tree) without writing.
+stream live progress and accept `dryRun: true` to preview a transfer (handy
+before pushing a large tree) without writing. The progress flag is chosen by
+local rsync version — `--info=progress2` on rsync ≥ 3.1, `--progress` on the
+rsync 2.6.9 Apple ships by default (so push/pull work out of the box on stock
+macOS). Missing rsync gives an actionable error (`brew install rsync`).
+
+## Auto-sync (`ssh_sync`)
+
+`start | stop | status`. Does an initial full push, then a debounced local
+`fs.watch` rsyncs the workspace to the remote on every change
+(`.gitignore`-filtered) — removing the manual `ssh_push` step from the
+edit-locally/run-remotely loop. One watcher at a time; stops on disconnect.
+Recursive `fs.watch` requires macOS/Windows (on Linux use `ssh_push`).
+
+## Port forwarding (`ssh_tunnel`)
+
+`open | close | list`. Forwards a remote port to a local port via
+`ssh -O forward/cancel -L` over the shared ControlMaster, so a remote dev server
+/ TensorBoard / Jupyter / web UI is reachable at `http://localhost:<localPort>`.
+Tunnels close automatically on disconnect.
+
+```
+ssh_tunnel open  remotePort=8080            # localhost:8080 -> remote 127.0.0.1:8080
+ssh_tunnel open  localPort=9000 remotePort=6006   # TensorBoard
+ssh_tunnel list
+ssh_tunnel close localPort=8080
+```
 
 ## Design notes
 
@@ -75,6 +118,8 @@ transfer (handy before pushing a large tree) without writing.
   remote profile banner cannot corrupt status parsing or byte offsets.
 - `ssh_read` reports a useful reason (missing / is-a-directory / unreadable)
   instead of an opaque `SSH failed (1)`.
+- `ssh_find` returns paths relative to the remote search root (not mangled
+  `../../../` paths) and honors `.gitignore` via remote `git check-ignore`.
 - `ssh_bash` accepts `tty: true` to allocate a remote pty (`ssh -tt`) for
   commands that need a terminal.
 

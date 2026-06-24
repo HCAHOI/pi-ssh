@@ -41,7 +41,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { type FSWatcher, mkdirSync, readFileSync, watch, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -387,29 +387,45 @@ function createRemoteFindOps(t: SshTarget, localCwd: string): FindOperations {
 			return r.code === 0;
 		},
 		glob: async (pattern, cwd, options) => {
+			// Returns paths relative to the remote search root, then prefixes the LOCAL
+			// search cwd so the SDK find tool slices them back to clean relative output
+			// (returning absolute remote paths makes it relativize against the local cwd
+			// and emit ../../../root/... garbage). Honors .gitignore via `git check-ignore`
+			// (the established tool) when the root is a git repo and git is present.
 			const script = `
-import fnmatch, json, os, sys
+import fnmatch, json, os, subprocess, sys
 payload = json.load(sys.stdin)
 root = payload['root']
 pattern = payload['pattern']
 limit = int(payload['limit'])
-results = []
+use_gitignore = payload.get('gitignore', True)
+candidates = []
 for dirpath, dirnames, filenames in os.walk(root):
     dirnames[:] = [d for d in dirnames if d not in {'.git', 'node_modules'}]
     for name in filenames:
         path = os.path.join(dirpath, name)
         rel = os.path.relpath(path, root).replace(os.sep, '/')
         if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(name, pattern):
-            results.append(path)
-            if len(results) >= limit:
-                print(json.dumps(results))
-                sys.exit(0)
-print(json.dumps(results))
+            candidates.append(rel)
+if use_gitignore and candidates and os.path.exists(os.path.join(root, '.git')):
+    try:
+        proc = subprocess.run(['git', '-C', root, 'check-ignore', '--stdin'],
+            input='\\n'.join(candidates), capture_output=True, text=True)
+        if proc.returncode in (0, 1):
+            ignored = set(filter(None, proc.stdout.split('\\n')))
+            candidates = [c for c in candidates if c not in ignored]
+    except FileNotFoundError:
+        pass
+print(json.dumps(candidates[:limit]))
 `;
 			const payload = JSON.stringify({ root: toRemote(cwd), pattern, limit: options.limit });
 			const r = await runRemoteCommand(t, `python3 -c ${shQuote(script)}`, { stdin: payload });
 			if (r.code !== 0) throw new Error(r.stderr.toString().trim() || sshFailureMessage(r));
-			return JSON.parse(r.stdout.toString()) as string[];
+			const rels = JSON.parse(r.stdout.toString()) as string[];
+			// Prefix the LOCAL search cwd so createFindTool's `p.slice(searchPath+1)`
+			// yields the remote-root-relative path verbatim.
+			const base = stripTrailingSlash(cwd);
+			return rels.map((rel) => `${base}/${rel}`);
 		},
 	};
 }
@@ -756,6 +772,10 @@ export default function (pi: ExtensionAPI) {
 		return parsed && typeof parsed === "object" ? (parsed as Record<string, string>) : {};
 	}
 
+	function profileNames(): string[] {
+		return Object.keys(loadProfiles()).sort();
+	}
+
 	// Expand a leading @name into the saved target string; trailing tokens override.
 	function expandProfile(arg: string): string {
 		const trimmed = arg.trim();
@@ -788,15 +808,29 @@ export default function (pi: ExtensionAPI) {
 
 	async function switchTarget(arg: string): Promise<SshTarget> {
 		const next = await connect(arg);
-		stopAllPollers();
-		if (target) await closeMaster(target);
+		const prev = target;
+		// Reconnecting to the SAME host+cwd (same .pi-ssh-processes registry): keep the
+		// in-memory pollers and just repoint them at the new connection, so a reconnect
+		// never silently drops a still-pending completion / log-watch notification.
+		if (prev && prev.remote === next.remote && prev.remoteCwd === next.remoteCwd) {
+			for (const p of pollers.values()) p.target = next;
+		} else {
+			stopAllPollers();
+		}
+		if (prev) await closeMaster(prev);
 		target = next;
+		stopAllTunnels();
+		await rehydratePollers(next);
 		return next;
 	}
 
 	async function disconnect(): Promise<void> {
 		stopAllPollers();
-		if (target) await closeMaster(target);
+		stopSyncWatcher();
+		if (target) {
+			stopAllTunnels();
+			await closeMaster(target);
+		}
 		target = null;
 	}
 
@@ -889,6 +923,9 @@ export default function (pi: ExtensionAPI) {
 		else if (code === null) outcome = "killed"; // exit_code absent => SIGKILL (EXIT trap never ran)
 		else if (code >= 128) outcome = "killed"; // 128 + signal
 		else outcome = "failure";
+		// Mark completion handled so a later reconnect/rehydrate never re-notifies for
+		// this job, regardless of whether this particular alert was opted into.
+		await runRemoteCommand(p.target, `touch -- ${shQuote(`${p.dir}/notified`)}`, { timeout: 20, login: false }).catch(() => {});
 		const want = outcome === "success" ? p.alertOnSuccess : outcome === "killed" ? p.alertOnKill : p.alertOnFailure;
 		if (!want) return;
 		const tailCmd = `d=${shQuote(p.dir)}; echo '--- stdout (tail) ---'; tail -n 15 "$d/stdout.log" 2>/dev/null; echo '--- stderr (tail) ---'; tail -n 15 "$d/stderr.log" 2>/dev/null`;
@@ -946,11 +983,16 @@ export default function (pi: ExtensionAPI) {
 		alertOnFailure: boolean;
 		alertOnKill: boolean;
 		watches: WatchState[];
+		/** Initial byte offsets. Fresh start: {0,0} (watch from the top). Rehydrate on
+		 * reconnect/restart: seek to current EOF so historical log lines are not
+		 * re-matched (only completion + new lines fire). */
+		offsets?: { stdout: number; stderr: number };
 	}): void {
 		if (!args.alertOnSuccess && !args.alertOnFailure && !args.alertOnKill && args.watches.length === 0) return;
+		if (pollers.has(args.procId)) return; // already tracked
 		const state: PollerState = {
 			...args,
-			off: { stdout: 0, stderr: 0 },
+			off: args.offsets ?? { stdout: 0, stderr: 0 },
 			timer: null,
 			busy: false,
 			finished: false,
@@ -960,6 +1002,105 @@ export default function (pi: ExtensionAPI) {
 			void tick(state);
 		}, POLL_INTERVAL_MS);
 		state.timer.unref?.();
+	}
+
+	function buildWatchStates(specs: WatchSpec[] | undefined): WatchState[] {
+		return (specs ?? []).map((w) => {
+			let re: RegExp;
+			try {
+				re = new RegExp(w.pattern);
+			} catch (e) {
+				throw new Error(`Invalid logWatches pattern /${w.pattern}/: ${e instanceof Error ? e.message : String(e)}`);
+			}
+			return { re, pattern: w.pattern, stream: w.stream ?? "both", repeat: w.repeat ?? false, fired: false };
+		});
+	}
+
+	interface NotifyConfig {
+		name?: string;
+		alertOnSuccess?: boolean;
+		alertOnFailure?: boolean;
+		alertOnKill?: boolean;
+		watches?: WatchSpec[];
+	}
+
+	// Re-arm pollers from each job's persisted notify.json after a (re)connect, so
+	// completion / log-watch notifications survive reconnect, ssh_connect switching,
+	// and full pi restarts. Jobs already tracked or already notified are skipped;
+	// offsets seek to EOF so historical watch lines do not re-fire. A finished,
+	// un-notified job fires its missed completion on the first tick.
+	async function rehydratePollers(t: SshTarget): Promise<void> {
+		if (!t.hasPython) return;
+		const root = processRoot(t);
+		const script = `
+import base64, json, os, sys
+root = sys.argv[1]
+out = []
+if os.path.isdir(root):
+    for d in sorted(os.listdir(root)):
+        p = os.path.join(root, d)
+        nf = os.path.join(p, 'notify.json')
+        if not (os.path.isdir(p) and os.path.isfile(nf)):
+            continue
+        try:
+            notify = open(nf).read()
+        except OSError:
+            continue
+        pid = ''
+        try:
+            pid = open(os.path.join(p, 'pid')).read().strip()
+        except OSError:
+            pass
+        running = False
+        if pid:
+            try:
+                os.kill(int(pid), 0)
+                running = True
+            except (OSError, ValueError):
+                running = False
+        def sz(f):
+            try:
+                return os.path.getsize(os.path.join(p, f))
+            except OSError:
+                return 0
+        out.append({
+            'id': d,
+            'notify': base64.b64encode(notify.encode()).decode(),
+            'running': running,
+            'notified': os.path.isfile(os.path.join(p, 'notified')),
+            'outSize': sz('stdout.log'),
+            'errSize': sz('stderr.log'),
+        })
+print(json.dumps(out))
+`;
+		let entries: Array<{ id: string; notify: string; running: boolean; notified: boolean; outSize: number; errSize: number }>;
+		try {
+			const r = await runRemoteCommand(t, `python3 -c ${shQuote(script)} ${shQuote(root)}`, { timeout: 20, login: false });
+			if (r.code !== 0) return;
+			entries = JSON.parse(r.stdout.toString() || "[]");
+		} catch {
+			return;
+		}
+		for (const e of entries) {
+			if (pollers.has(e.id) || e.notified) continue;
+			let cfg: NotifyConfig;
+			try {
+				cfg = JSON.parse(Buffer.from(e.notify, "base64").toString());
+			} catch {
+				continue;
+			}
+			startPoller({
+				procId: e.id,
+				name: cfg.name?.trim() || e.id,
+				dir: `${root}/${e.id}`,
+				target: t,
+				alertOnSuccess: cfg.alertOnSuccess ?? false,
+				alertOnFailure: cfg.alertOnFailure ?? true,
+				alertOnKill: cfg.alertOnKill ?? false,
+				watches: buildWatchStates(cfg.watches),
+				offsets: { stdout: e.outSize, stderr: e.errSize },
+			});
+		}
 	}
 
 	function requireTarget(): SshTarget {
@@ -1049,7 +1190,11 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Show active SSH connection status",
 		parameters: Type.Object({}),
 		async execute() {
-			return { content: [{ type: "text" as const, text: target ? connectedText(target) : "SSH: not connected" }] };
+			const base = target ? connectedText(target) : "SSH: not connected";
+			let profiles: string[] = [];
+			try { profiles = profileNames(); } catch { /* corrupt profiles file: ignore for status */ }
+			const profileLine = profiles.length ? `\nSaved profiles (reconnect with ssh_connect '@name'): ${profiles.map((n) => `@${n}`).join(", ")}` : "";
+			return { content: [{ type: "text" as const, text: base + profileLine }] };
 		},
 	});
 
@@ -1278,6 +1423,29 @@ export default function (pi: ExtensionAPI) {
 		return ["ssh", ...t.sshOptions, ...baseSshOptions(t.socket)].map(shQuote).join(" ");
 	}
 
+	// rsync >= 3.1 supports --info=progress2 (single clean progress line); the
+	// rsync Apple ships by default (2.6.9) rejects it with a cryptic usage dump.
+	// Probe once and fall back to --progress so push/pull work out of the box on
+	// stock macOS. Cached for the session.
+	let rsyncProgressFlagCache: string | null = null;
+	async function rsyncProgressFlag(): Promise<string> {
+		if (rsyncProgressFlagCache) return rsyncProgressFlagCache;
+		try {
+			const r = await runLocalProcess("rsync", ["--version"]);
+			const m = r.stdout.toString().match(/rsync\s+version\s+(\d+)\.(\d+)/i);
+			const major = m ? Number.parseInt(m[1], 10) : 0;
+			const minor = m ? Number.parseInt(m[2], 10) : 0;
+			const modern = major > 3 || (major === 3 && minor >= 1);
+			rsyncProgressFlagCache = modern ? "--info=progress2" : "--progress";
+		} catch (e) {
+			if ((e as NodeJS.ErrnoException)?.code === "ENOENT") {
+				throw new Error("rsync not found on this machine. Install it (macOS: `brew install rsync`) to use ssh_push/ssh_pull/ssh_sync.");
+			}
+			rsyncProgressFlagCache = "--progress"; // unknown version: assume old/safe
+		}
+		return rsyncProgressFlagCache;
+	}
+
 	function ensureTrailingSlash(path: string): string {
 		return path.endsWith("/") ? path : `${path}/`;
 	}
@@ -1298,18 +1466,40 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
+	// Shared rsync push/pull core (used by ssh_push, ssh_pull, and ssh_sync).
+	async function runRsyncTransfer(
+		t: SshTarget,
+		source: string,
+		dest: string,
+		opts: { delete?: boolean; dryRun?: boolean; excludes?: string[]; gitignore?: boolean; quiet?: boolean },
+		signal?: AbortSignal,
+		onData?: (chunk: Buffer) => void,
+	): Promise<{ stdout: string; stderr: string }> {
+		const progress = opts.quiet ? [] : [await rsyncProgressFlag(), "--itemize-changes", "--human-readable", "--stats"];
+		const args = ["-az", ...progress];
+		if (opts.gitignore) args.push("--filter=:- .gitignore", "--exclude", ".git/");
+		args.push("-e", rsyncSshCommand(t));
+		for (const exclude of opts.excludes ?? []) args.push("--exclude", exclude);
+		if (opts.delete) args.push("--delete");
+		if (opts.dryRun) args.push("--dry-run");
+		args.push(source, dest);
+		const r = await runLocalProcess("rsync", args, signal, onData);
+		if (r.code !== 0) throw new Error(`rsync failed (${r.code ?? "unknown"}): ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
+		return { stdout: r.stdout.toString().trim(), stderr: r.stderr.toString().trim() };
+	}
+
 	pi.registerTool({
 		name: "ssh_process",
 		label: "ssh_process",
-		description: "Manage long-running processes on the active SSH remote. Starts commands in the background with logs under remote .pi-ssh-processes/<id>/; supports start/list/output/logs/kill/clear. list and output report the captured exit code once a job finishes; clear prunes finished jobs. On start, alertOnSuccess/alertOnFailure/alertOnKill and logWatches push a notification (re-engaging the agent) when the job ends or a log line matches — so you never poll. Notifications survive Mac sleep: missed completions/log lines are swept on the first reconnect after wake.",
+		description: "Manage long-running processes on the active SSH remote. Starts commands in the background with logs under remote .pi-ssh-processes/<id>/; supports start/list/output/logs/kill/clear/attach. output accepts followSeconds to live-stream new log lines; attach re-arms completion/log-watch notifications for an existing job. list and output report the captured exit code once a job finishes; clear prunes finished jobs. On start, alertOnSuccess/alertOnFailure/alertOnKill and logWatches push a notification (re-engaging the agent) when the job ends or a log line matches — so you never poll. Notifications survive Mac sleep AND reconnect/pi-restart: each job persists its notify config and pollers are re-armed on connect, sweeping missed completions/log lines.",
 		promptSnippet: "Manage long-running remote SSH processes",
 		promptGuidelines: [
 			"Use ssh_process start for long-running remote jobs such as training, dev servers, and log tails instead of blocking ssh_bash.",
-			"Use ssh_process output to inspect recent stdout/stderr and ssh_process kill to stop remote jobs.",
-			"Background jobs push a notification when they finish or a logWatch matches — rely on it instead of polling list/output.",
+			"Use ssh_process output (optionally followSeconds) to inspect stdout/stderr and ssh_process kill to stop remote jobs.",
+			"Background jobs push a notification when they finish or a logWatch matches — rely on it instead of polling list/output. After a reconnect, use ssh_process attach <id> to resume notifications for a job started earlier.",
 		],
 		parameters: Type.Object({
-			action: Type.Union([Type.Literal("start"), Type.Literal("list"), Type.Literal("output"), Type.Literal("logs"), Type.Literal("kill"), Type.Literal("clear")]),
+			action: Type.Union([Type.Literal("start"), Type.Literal("list"), Type.Literal("output"), Type.Literal("logs"), Type.Literal("kill"), Type.Literal("clear"), Type.Literal("attach")]),
 			name: Type.Optional(Type.String({ description: "Friendly process name for start" })),
 			command: Type.Optional(Type.String({ description: "Command to start on the remote" })),
 			id: Type.Optional(Type.String({ description: "Remote process id returned by start/list" })),
@@ -1317,6 +1507,7 @@ export default function (pi: ExtensionAPI) {
 			env: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Environment variables exported before command" })),
 			commandPrefix: Type.Optional(Type.String({ description: "Shell code run before command" })),
 			lines: Type.Optional(Type.Number({ description: "Number of recent log lines for output (default 80)" })),
+			followSeconds: Type.Optional(Type.Number({ description: "output: stream new stdout/stderr lines live for this many seconds before returning" })),
 			alertOnSuccess: Type.Optional(Type.Boolean({ description: "start: notify when the job exits 0 (default false)" })),
 			alertOnFailure: Type.Optional(Type.Boolean({ description: "start: notify when the job exits non-zero (default true)" })),
 			alertOnKill: Type.Optional(Type.Boolean({ description: "start: notify when the job is killed by a signal (default false)" })),
@@ -1327,7 +1518,7 @@ export default function (pi: ExtensionAPI) {
 			}), { description: "start: notify when a log line matches; re-engages the agent" })),
 		}),
 		async execute(_id, params: {
-			action: "start" | "list" | "output" | "logs" | "kill" | "clear";
+			action: "start" | "list" | "output" | "logs" | "kill" | "clear" | "attach";
 			name?: string;
 			command?: string;
 			id?: string;
@@ -1335,11 +1526,12 @@ export default function (pi: ExtensionAPI) {
 			env?: Record<string, string>;
 			commandPrefix?: string;
 			lines?: number;
+			followSeconds?: number;
 			alertOnSuccess?: boolean;
 			alertOnFailure?: boolean;
 			alertOnKill?: boolean;
 			logWatches?: WatchSpec[];
-		}, signal) {
+		}, signal, onUpdate) {
 			const t = requireTarget();
 			const root = processRoot(t);
 			if (params.action === "start") {
@@ -1348,10 +1540,20 @@ export default function (pi: ExtensionAPI) {
 				const dir = `${root}/${procId}`;
 				const name = params.name?.trim() || procId;
 				const script = processRunScript(t, { command: params.command, cwd: params.cwd, env: params.env, commandPrefix: params.commandPrefix });
+				// Persist the notification config so pollers can be re-armed after a
+				// reconnect / pi restart (rehydratePollers reads this).
+				const notifyJson = JSON.stringify({
+					name,
+					alertOnSuccess: params.alertOnSuccess ?? false,
+					alertOnFailure: params.alertOnFailure ?? true,
+					alertOnKill: params.alertOnKill ?? false,
+					watches: params.logWatches ?? [],
+				} satisfies NotifyConfig);
 				const cmd = [
 					`mkdir -p ${shQuote(dir)}`,
 					`printf %s ${shQuote(name)} > ${shQuote(`${dir}/name`)}`,
 					`printf %s ${shQuote(params.command)} > ${shQuote(`${dir}/command`)}`,
+					`printf %s ${shQuote(notifyJson)} > ${shQuote(`${dir}/notify.json`)}`,
 					`cat > ${shQuote(`${dir}/run.sh`)}`,
 					`chmod +x ${shQuote(`${dir}/run.sh`)}`,
 					// Group with { ...; } so `&` backgrounds only nohup; echo $! then captures
@@ -1362,15 +1564,7 @@ export default function (pi: ExtensionAPI) {
 				].join(" && ");
 				const r = await runRemoteCommand(t, cmd, { stdin: script, signal });
 				if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
-				const watches: WatchState[] = (params.logWatches ?? []).map((w) => {
-					let re: RegExp;
-					try {
-						re = new RegExp(w.pattern);
-					} catch (e) {
-						throw new Error(`Invalid logWatches pattern /${w.pattern}/: ${e instanceof Error ? e.message : String(e)}`);
-					}
-					return { re, pattern: w.pattern, stream: w.stream ?? "both", repeat: w.repeat ?? false, fired: false };
-				});
+				const watches: WatchState[] = buildWatchStates(params.logWatches);
 				startPoller({
 					procId,
 					name,
@@ -1409,8 +1603,61 @@ export default function (pi: ExtensionAPI) {
 			if (!params.id?.trim()) throw new Error(`ssh_process ${params.action} requires id`);
 			const dir = `${root}/${params.id}`;
 
+			if (params.action === "attach") {
+				if (pollers.has(params.id)) {
+					return { content: [{ type: "text" as const, text: `Already watching ${params.id}.` }] };
+				}
+				const probe = `d=${shQuote(dir)}; if [ ! -d "$d" ]; then echo 'process not found' >&2; exit 2; fi; o=$(wc -c < "$d/stdout.log" 2>/dev/null || echo 0); e=$(wc -c < "$d/stderr.log" 2>/dev/null || echo 0); n=$(base64 < "$d/notify.json" 2>/dev/null | tr -d '\n'); printf '%s\t%s\t%s\n' "$o" "$e" "$n"`;
+				const pr = await runRemoteCommand(t, probe, { signal, login: false });
+				if (pr.code !== 0) throw new Error(`${sshFailureMessage(pr)}: ${pr.stderr.toString().trim() || pr.stdout.toString().trim()}`);
+				const [outStr = "0", errStr = "0", notifyB64 = ""] = pr.stdout.toString().trim().split("\t");
+				let saved: NotifyConfig = {};
+				if (notifyB64) {
+					try { saved = JSON.parse(Buffer.from(notifyB64, "base64").toString()); } catch { /* ignore corrupt config */ }
+				}
+				const cfg: Required<NotifyConfig> = {
+					name: params.name?.trim() || saved.name || params.id,
+					alertOnSuccess: params.alertOnSuccess ?? saved.alertOnSuccess ?? true,
+					alertOnFailure: params.alertOnFailure ?? saved.alertOnFailure ?? true,
+					alertOnKill: params.alertOnKill ?? saved.alertOnKill ?? false,
+					watches: params.logWatches ?? saved.watches ?? [],
+				};
+				// Persist merged prefs and clear the notified marker so a finished job
+				// re-fires its completion exactly once for this explicit attach.
+				const persist = `d=${shQuote(dir)}; printf %s ${shQuote(JSON.stringify(cfg))} > "$d/notify.json"; rm -f "$d/notified"`;
+				await runRemoteCommand(t, persist, { signal, login: false }).catch(() => {});
+				startPoller({
+					procId: params.id,
+					name: cfg.name,
+					dir,
+					target: t,
+					alertOnSuccess: cfg.alertOnSuccess,
+					alertOnFailure: cfg.alertOnFailure,
+					alertOnKill: cfg.alertOnKill,
+					watches: buildWatchStates(cfg.watches),
+					offsets: { stdout: Number.parseInt(outStr, 10) || 0, stderr: Number.parseInt(errStr, 10) || 0 },
+				});
+				return { content: [{ type: "text" as const, text: `Watching ${params.id} (${cfg.name}). Will notify on completion${cfg.watches.length ? " and matching log lines" : ""}.` }] };
+			}
+
 			if (params.action === "output") {
 				const lines = Math.max(1, Math.floor(params.lines ?? 80));
+				const follow = params.followSeconds && params.followSeconds > 0 ? Math.floor(params.followSeconds) : 0;
+				if (follow > 0) {
+					// Live stream new lines from both logs for `follow` seconds (bounded by the
+					// remote `timeout`), pushing incremental output to the tool view.
+					const ops = createRemoteBashOps(t, localCwd);
+					const MAX = 8 * 1024;
+					let acc = "";
+					const onData = (d: Buffer) => {
+						acc += d.toString();
+						if (acc.length > MAX) acc = `…${acc.slice(-MAX)}`;
+						onUpdate?.({ content: [{ type: "text", text: acc }], details: undefined });
+					};
+					await ops
+						.exec(`timeout ${follow} tail -n ${lines} -F stdout.log stderr.log 2>/dev/null`, dir, { onData, signal, timeout: follow + 15 })
+						.catch(() => {});
+				}
 				const cmd = `d=${shQuote(dir)}; test -d "$d" || { echo 'process not found' >&2; exit 2; }; echo '--- stdout ---'; tail -n ${lines} "$d/stdout.log" 2>/dev/null || true; echo '--- stderr ---'; tail -n ${lines} "$d/stderr.log" 2>/dev/null || true; pid=$(cat "$d/pid" 2>/dev/null || true); if [ -f "$d/exit_code" ]; then echo "--- exited, code: $(cat "$d/exit_code") ---"; elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo "--- still running (pid $pid) ---"; else echo '--- exited (no exit code recorded) ---'; fi`;
 				const r = await runRemoteCommand(t, cmd, { signal });
 				if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
@@ -1448,15 +1695,16 @@ export default function (pi: ExtensionAPI) {
 			const t = requireTarget();
 			const localSource = ensureTrailingSlash(resolve(localCwd, params.localPath ?? "."));
 			const remoteDest = ensureTrailingSlash(params.remotePath ? toRemotePath(params.remotePath, localCwd, t.remoteCwd) : t.remoteCwd);
-			const args = ["-az", "--info=progress2", "--itemize-changes", "--human-readable", "--stats", "--filter=:- .gitignore", "--exclude", ".git/", "-e", rsyncSshCommand(t)];
-			for (const exclude of params.excludes ?? []) args.push("--exclude", exclude);
-			if (params.delete) args.push("--delete");
-			if (params.dryRun) args.push("--dry-run");
-			args.push(localSource, `${t.remote}:${remoteDest}`);
-			const r = await runLocalProcess("rsync", args, signal, rsyncStreamer(onUpdate));
-			if (r.code !== 0) throw new Error(`rsync failed (${r.code ?? "unknown"}): ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
+			const { stdout } = await runRsyncTransfer(
+				t,
+				localSource,
+				`${t.remote}:${remoteDest}`,
+				{ delete: params.delete, dryRun: params.dryRun, excludes: params.excludes, gitignore: true },
+				signal,
+				rsyncStreamer(onUpdate),
+			);
 			const prefix = params.dryRun ? "[dry-run] " : "";
-			return { content: [{ type: "text" as const, text: `${prefix}${r.stdout.toString().trim() || `Pushed ${localSource} -> ${t.remote}:${remoteDest}`}` }] };
+			return { content: [{ type: "text" as const, text: `${prefix}${stdout || `Pushed ${localSource} -> ${t.remote}:${remoteDest}`}` }] };
 		},
 	});
 
@@ -1476,15 +1724,176 @@ export default function (pi: ExtensionAPI) {
 			const t = requireTarget();
 			const remoteSource = ensureTrailingSlash(params.remotePath ? toRemotePath(params.remotePath, localCwd, t.remoteCwd) : t.remoteCwd);
 			const localDest = ensureTrailingSlash(resolve(localCwd, params.localPath ?? "."));
-			const args = ["-az", "--info=progress2", "--itemize-changes", "--human-readable", "--stats", "-e", rsyncSshCommand(t)];
-			for (const exclude of params.excludes ?? []) args.push("--exclude", exclude);
-			if (params.delete) args.push("--delete");
-			if (params.dryRun) args.push("--dry-run");
-			args.push(`${t.remote}:${remoteSource}`, localDest);
-			const r = await runLocalProcess("rsync", args, signal, rsyncStreamer(onUpdate));
-			if (r.code !== 0) throw new Error(`rsync failed (${r.code ?? "unknown"}): ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
+			const { stdout } = await runRsyncTransfer(
+				t,
+				`${t.remote}:${remoteSource}`,
+				localDest,
+				{ delete: params.delete, dryRun: params.dryRun, excludes: params.excludes, gitignore: false },
+				signal,
+				rsyncStreamer(onUpdate),
+			);
 			const prefix = params.dryRun ? "[dry-run] " : "";
-			return { content: [{ type: "text" as const, text: `${prefix}${r.stdout.toString().trim() || `Pulled ${t.remote}:${remoteSource} -> ${localDest}`}` }] };
+			return { content: [{ type: "text" as const, text: `${prefix}${stdout || `Pulled ${t.remote}:${remoteSource} -> ${localDest}`}` }] };
+		},
+	});
+
+	// ---------------------------------------------------------------------------
+	// Port forwarding (ssh_tunnel) — local port <- remote port over the master
+	// ---------------------------------------------------------------------------
+	interface TunnelState { localPort: number; remoteHost: string; remotePort: number; spec: string; }
+	const tunnels = new Map<number, TunnelState>();
+
+	function tunnelControl(t: SshTarget, action: "forward" | "cancel", spec: string): Promise<RunResult> {
+		// `ssh -O forward/cancel -L <spec> host` asks the running ControlMaster to open
+		// or close a forward without spawning a new session.
+		return runSsh([...t.sshOptions, ...baseSshOptions(t.socket), "-O", action, "-L", spec, "--", t.remote], { timeout: 10 });
+	}
+
+	function stopAllTunnels(): void {
+		if (!target) {
+			tunnels.clear();
+			return;
+		}
+		for (const tn of tunnels.values()) void tunnelControl(target, "cancel", tn.spec).catch(() => {});
+		tunnels.clear();
+	}
+
+	pi.registerTool({
+		name: "ssh_tunnel",
+		label: "ssh_tunnel",
+		description: "Port-forward a remote port to a local port over the shared SSH connection, so a remote dev server / TensorBoard / Jupyter / web UI is reachable from the local browser at http://localhost:<localPort>. Actions: open | close | list. Tunnels are closed automatically on disconnect.",
+		promptSnippet: "Forward a remote port to localhost over SSH",
+		promptGuidelines: ["Use ssh_tunnel open to view a remote web UI / dev server / TensorBoard locally; close it with ssh_tunnel close when done."],
+		parameters: Type.Object({
+			action: Type.Union([Type.Literal("open"), Type.Literal("close"), Type.Literal("list")]),
+			localPort: Type.Optional(Type.Number({ description: "Local port to bind (open/close). Defaults to remotePort." })),
+			remotePort: Type.Optional(Type.Number({ description: "Remote port to forward (required for open)" })),
+			remoteHost: Type.Optional(Type.String({ description: "Remote-side host the port lives on (default 127.0.0.1)" })),
+		}),
+		async execute(_id, params: { action: "open" | "close" | "list"; localPort?: number; remotePort?: number; remoteHost?: string }) {
+			const t = requireTarget();
+			if (params.action === "list") {
+				if (tunnels.size === 0) return { content: [{ type: "text" as const, text: "No active tunnels." }] };
+				const text = [...tunnels.values()].map((tn) => `localhost:${tn.localPort} -> ${t.remote} ${tn.remoteHost}:${tn.remotePort}`).join("\n");
+				return { content: [{ type: "text" as const, text }] };
+			}
+			const remoteHost = params.remoteHost?.trim() || "127.0.0.1";
+			if (params.action === "open") {
+				if (!params.remotePort) throw new Error("ssh_tunnel open requires remotePort");
+				const localPort = params.localPort ?? params.remotePort;
+				const spec = `${localPort}:${remoteHost}:${params.remotePort}`;
+				if (tunnels.has(localPort)) throw new Error(`Local port ${localPort} already forwarded; close it first.`);
+				const r = await tunnelControl(t, "forward", spec);
+				if (r.code !== 0) throw new Error(`Tunnel open failed: ${r.stderr.toString().trim() || r.stdout.toString().trim() || sshFailureMessage(r)}`);
+				tunnels.set(localPort, { localPort, remoteHost, remotePort: params.remotePort, spec });
+				return { content: [{ type: "text" as const, text: `Tunnel open: http://localhost:${localPort} -> ${t.remote} ${remoteHost}:${params.remotePort}` }] };
+			}
+			// close
+			const localPort = params.localPort ?? params.remotePort;
+			if (!localPort) throw new Error("ssh_tunnel close requires localPort (or remotePort)");
+			const tn = tunnels.get(localPort);
+			if (!tn) throw new Error(`No tunnel on local port ${localPort}.`);
+			const r = await tunnelControl(t, "cancel", tn.spec);
+			tunnels.delete(localPort);
+			if (r.code !== 0) throw new Error(`Tunnel close reported: ${r.stderr.toString().trim() || sshFailureMessage(r)}`);
+			return { content: [{ type: "text" as const, text: `Tunnel closed: localhost:${localPort}` }] };
+		},
+	});
+
+	// ---------------------------------------------------------------------------
+	// Auto-sync (ssh_sync) — debounced rsync of the local workspace on change
+	// ---------------------------------------------------------------------------
+	interface SyncState {
+		watcher: FSWatcher;
+		localSource: string;
+		remoteDest: string;
+		remote: string;
+		debounceMs: number;
+		delete: boolean;
+		excludes?: string[];
+		timer: NodeJS.Timeout | null;
+		syncing: boolean;
+		pending: boolean;
+		count: number;
+	}
+	let syncState: SyncState | null = null;
+
+	function stopSyncWatcher(): void {
+		if (!syncState) return;
+		if (syncState.timer) clearTimeout(syncState.timer);
+		try { syncState.watcher.close(); } catch { /* already closed */ }
+		syncState = null;
+	}
+
+	async function runSync(s: SyncState): Promise<void> {
+		if (!target || target.remote !== s.remote) { stopSyncWatcher(); return; }
+		if (s.syncing) { s.pending = true; return; }
+		s.syncing = true;
+		try {
+			await runRsyncTransfer(target, s.localSource, `${s.remote}:${s.remoteDest}`, { delete: s.delete, excludes: s.excludes, gitignore: true, quiet: true });
+			s.count += 1;
+		} catch (e) {
+			emit(`⚠️ ssh_sync failed: ${e instanceof Error ? e.message : String(e)}`, { kind: "sync-error" });
+		} finally {
+			s.syncing = false;
+			if (s.pending) { s.pending = false; scheduleSync(s); }
+		}
+	}
+
+	function scheduleSync(s: SyncState): void {
+		if (s.timer) clearTimeout(s.timer);
+		s.timer = setTimeout(() => { s.timer = null; void runSync(s); }, s.debounceMs);
+		s.timer.unref?.();
+	}
+
+	pi.registerTool({
+		name: "ssh_sync",
+		label: "ssh_sync",
+		description: "Auto-sync the local workspace to the active SSH remote on every local file change (debounced rsync, .gitignore-filtered). Removes the manual ssh_push step from the edit-locally/run-remotely loop. Actions: start | stop | status. Only one watcher at a time; stops on disconnect.",
+		promptSnippet: "Continuously rsync local edits to the remote on change",
+		promptGuidelines: ["Use ssh_sync start to keep the remote in lockstep with local edits instead of calling ssh_push after every change; stop it when done."],
+		parameters: Type.Object({
+			action: Type.Union([Type.Literal("start"), Type.Literal("stop"), Type.Literal("status")]),
+			localPath: Type.Optional(Type.String({ description: "Local path to watch+sync, defaults to current workspace" })),
+			remotePath: Type.Optional(Type.String({ description: "Remote destination path, defaults to remote cwd" })),
+			debounceMs: Type.Optional(Type.Number({ description: "Quiet period after a change before syncing (default 400)" })),
+			delete: Type.Optional(Type.Boolean({ description: "Mirror local deletions to the remote (default false)" })),
+			excludes: Type.Optional(Type.Array(Type.String(), { description: "Additional rsync exclude patterns" })),
+		}),
+		async execute(_id, params: { action: "start" | "stop" | "status"; localPath?: string; remotePath?: string; debounceMs?: number; delete?: boolean; excludes?: string[] }) {
+			const t = requireTarget();
+			if (params.action === "status") {
+				if (!syncState) return { content: [{ type: "text" as const, text: "ssh_sync: not running." }] };
+				return { content: [{ type: "text" as const, text: `ssh_sync: watching ${syncState.localSource} -> ${syncState.remote}:${syncState.remoteDest} (${syncState.count} syncs so far)` }] };
+			}
+			if (params.action === "stop") {
+				const was = syncState ? `${syncState.count}` : null;
+				stopSyncWatcher();
+				return { content: [{ type: "text" as const, text: was === null ? "ssh_sync was not running." : `ssh_sync stopped (${was} syncs).` }] };
+			}
+			// start
+			stopSyncWatcher();
+			const localSource = ensureTrailingSlash(resolve(localCwd, params.localPath ?? "."));
+			const remoteDest = ensureTrailingSlash(params.remotePath ? toRemotePath(params.remotePath, localCwd, t.remoteCwd) : t.remoteCwd);
+			// Initial full sync so the remote starts in lockstep.
+			const initial = await runRsyncTransfer(t, localSource, `${t.remote}:${remoteDest}`, { delete: params.delete, excludes: params.excludes, gitignore: true }, undefined);
+			const debounceMs = Math.max(50, Math.floor(params.debounceMs ?? 400));
+			let watcher: FSWatcher;
+			try {
+				watcher = watch(resolve(localCwd, params.localPath ?? "."), { recursive: true });
+			} catch (e) {
+				throw new Error(`ssh_sync could not watch ${localSource}: ${e instanceof Error ? e.message : String(e)} (recursive fs.watch requires macOS/Windows; on Linux use ssh_push)`);
+			}
+			const s: SyncState = { watcher, localSource, remoteDest, remote: t.remote, debounceMs, delete: params.delete ?? false, excludes: params.excludes, timer: null, syncing: false, pending: false, count: 0 };
+			watcher.on("change", (_event, file) => {
+				// Cheap noise filter: skip VCS/build churn that rsync would exclude anyway.
+				const name = typeof file === "string" ? file : file?.toString() ?? "";
+				if (/(^|\/)\.git\/|(^|\/)node_modules\/|~$|\.swp$/.test(name)) return;
+				scheduleSync(s);
+			});
+			watcher.on("error", (e) => emit(`⚠️ ssh_sync watcher error: ${e instanceof Error ? e.message : String(e)}`, { kind: "sync-error" }));
+			syncState = s;
+			return { content: [{ type: "text" as const, text: `ssh_sync started: ${localSource} -> ${t.remote}:${remoteDest} (debounce ${debounceMs}ms).\n${initial.stdout.split("\n").slice(-3).join("\n")}` }] };
 		},
 	});
 
@@ -1519,7 +1928,7 @@ export default function (pi: ExtensionAPI) {
 
 	// --- runtime connect/disconnect/status ---
 	pi.registerCommand("ssh", {
-		description: "SSH remote: /ssh [-i key] user@host[:/path] [--activate <cmd>] [--env K=V] | /ssh @profile | /ssh cd <dir> | /ssh save <name> | /ssh off | /ssh",
+		description: "SSH remote: /ssh [-i key] user@host[:/path] [--activate <cmd>] [--env K=V] | /ssh @profile | /ssh cd <dir> | /ssh save <name> | /ssh profiles | /ssh off | /ssh",
 		handler: async (args, ctx) => {
 			const arg = args.trim();
 
@@ -1551,6 +1960,17 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(`SSH cwd -> ${t.remoteCwd}`, "info");
 				} catch (e) {
 					ctx.ui.notify(`SSH cd failed: ${e instanceof Error ? e.message : String(e)}`, "error");
+				}
+				return;
+			}
+
+			// /ssh profiles: list saved connection handles.
+			if (arg === "profiles" || arg === "ls") {
+				try {
+					const names = profileNames();
+					ctx.ui.notify(names.length ? `Saved SSH profiles: ${names.map((n) => `@${n}`).join(", ")}` : `No saved profiles. Connect, then /ssh save <name> (stored in ${profilesPath()}).`, "info");
+				} catch (e) {
+					ctx.ui.notify(`SSH profiles error: ${e instanceof Error ? e.message : String(e)}`, "error");
 				}
 				return;
 			}
