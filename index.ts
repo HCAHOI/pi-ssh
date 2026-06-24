@@ -1279,9 +1279,11 @@ print(json.dumps(out))
 
 	function hostTag(theme: any): string {
 		const t = target;
-		// `success` (green) so the host badge is clearly visible across themes — `muted`
-		renders too close to the default foreground in many themes. Reads as the live remote.
-		return t ? theme.fg("success", `[${t.remote}]`) : "";
+		// The tool-call title renders on a colored Box bg (toolPendingBg/toolSuccessBg/
+		// toolErrorBg). `success` clashes with the green success bg and `muted` is too
+		// low-contrast; `warning` (amber) is one of the colors the local tools use, so it
+		// stays readable on every tool bg and is distinct from the accent path.
+		return t ? theme.fg("warning", `[${t.remote}]`) : "";
 	}
 
 	// Build the one-line tool-call title, reusing the prior Text component.
