@@ -1325,14 +1325,12 @@ print(json.dumps(out))
 		promptSnippet: "Execute bash commands on the active SSH remote",
 		promptGuidelines: [
 			"Use ssh_bash for remote testing or GPU/server commands. Use bash for local commands and local file operations.",
-			"Use ssh_bash.env for remote environment variables such as PYTHONSRC instead of hand-prefixing fragile shell strings.",
-			"Use ssh_bash.delaySeconds when the user asks to wait before running a remote check; increase timeout to include the delay.",
 		],
 		parameters: Type.Object({
 			command: Type.String({ description: "Bash command to execute on the active SSH remote" }),
 			timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (include delaySeconds in this budget)" })),
 			cwd: Type.Optional(Type.String({ description: "Working directory for this command, remote absolute path or local workspace path mapped under the remote cwd" })),
-			delaySeconds: Type.Optional(Type.Number({ description: "Seconds to sleep on the remote before running command" })),
+			delaySeconds: Type.Optional(Type.Number({ description: "Seconds to sleep on the remote before running command (increase timeout to cover it)" })),
 			env: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Environment variables exported before command, e.g. {\"PYTHONSRC\": \"/path\"}" })),
 			commandPrefix: Type.Optional(Type.String({ description: "Shell code run before command, e.g. 'source .venv/bin/activate'" })),
 			tty: Type.Optional(Type.Boolean({ description: "Allocate a remote pty (ssh -tt) for commands that need a terminal (progress bars, some CLIs). Default false." })),
