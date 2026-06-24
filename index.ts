@@ -731,9 +731,10 @@ export default function (pi: ExtensionAPI) {
 		env?: Record<string, string>;
 		commandPrefix?: string;
 	}): string {
+		// Order mirrors processRunScript: cd -> env -> activation -> per-call prefix -> command.
 		const parts: string[] = [];
-		parts.push(...buildEnvExports({ ...t.defaultEnv, ...params.env }));
 		if (params.cwd?.trim()) parts.push(`cd -- ${shQuote(toRemotePath(params.cwd, localCwd, t.remoteCwd))}`);
+		parts.push(...buildEnvExports({ ...t.defaultEnv, ...params.env }));
 		if (t.defaultCommandPrefix?.trim()) parts.push(t.defaultCommandPrefix);
 		if (params.commandPrefix?.trim()) parts.push(params.commandPrefix);
 		if (params.delaySeconds !== undefined) {
@@ -966,6 +967,11 @@ export default function (pi: ExtensionAPI) {
 			// or error under set -e). A trailing capture line would be skipped whenever
 			// the command itself calls exit, so an EXIT trap is the robust choice.
 			`trap '__pi_rc=$?; printf %s "$__pi_rc" > "$__pi_dir/exit_code"' EXIT`,
+			// Record our own pid authoritatively. The launcher seeds pid with `echo $!`,
+			// but that is the `setsid` pid which on some systems is a short-lived parent;
+			// $$ here is the real job pid that list/output/kill rely on. Atomic mv avoids
+			// a torn read against the launcher's seed write.
+			`printf %s "$$" > "$__pi_dir/pid.tmp" && mv -f "$__pi_dir/pid.tmp" "$__pi_dir/pid"`,
 			`cd -- ${shQuote(cwd)}`,
 		];
 		lines.push(...buildEnvExports({ ...t.defaultEnv, ...params.env }));
