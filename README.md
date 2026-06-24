@@ -1,8 +1,24 @@
 # SSH Remote Execution Extension
 
 Edit locally, test/run remotely. Adds `ssh_*` tools
-(read/write/edit/grep/find/ls/bash/process/push/pull/sync/tunnel) that operate on
-an active SSH remote while the built-in `read`/`write`/`edit`/`bash` stay local.
+(read/write/edit/secret_write/grep/find/ls/bash/process/push/pull/sync/tunnel)
+that operate on an active SSH remote while the built-in
+`read`/`write`/`edit`/`bash` stay local.
+
+Zero third-party runtime dependencies — a single `index.ts` over node builtins
+and pi's bundled core packages, sharing one OpenSSH ControlMaster connection.
+
+## Install
+
+```bash
+pi install git:github.com/HCAHOI/pi-ssh
+# or try it for one run without installing:
+pi -e git:github.com/HCAHOI/pi-ssh
+```
+
+Then connect with `/ssh user@host[:/abs/path]` (see below). Requires key-based
+SSH auth (no password prompts) and `bash` on the remote; `python3` on the remote
+enables the efficient in-place `ssh_edit`.
 
 ## Connect
 
@@ -12,8 +28,23 @@ an active SSH remote while the built-in `read`/`write`/`edit`/`bash` stay local.
 /ssh cd subdir/or/abs/path                        # move remote cwd (no reconnect)
 /ssh profiles                                     # list saved profiles
 /ssh off                                          # disconnect
-/ssh                                              # status
+/ssh                                              # open the interactive dashboard
 ```
+
+### Dashboard (`/ssh` with no args)
+
+Bare `/ssh` opens an interactive overlay instead of a one-line status:
+
+- connection block (remote, cwd, python3, activation, env, tunnels, sync state)
+- a live process table (refreshes every ~2s) with status, runtime, pid
+- keys: `↑↓` select · `enter` live output (esc back) · `k` kill · `c` clear
+  finished · `r` refresh · `n` connect (profile picker) · `d` disconnect ·
+  `w` cwd · `y` toggle sync · `q`/`esc` close
+
+When connected, a compact `ssh: N running` widget shows above the editor whenever
+remote jobs are running, so activity is visible without opening the dashboard.
+The agent-facing `ssh_*` tools are unchanged — this is a human/TUI affordance.
+Free-form connect strings and `cd` targets prefill the editor with `/ssh …`.
 
 ### Connection profiles
 
@@ -36,6 +67,40 @@ venv / conda / PYTHONPATH setup is not repeated on each call:
 /ssh -i key root@host:/work --activate 'source .venv/bin/activate' --env PYTHONPATH=/work/src
 ```
 
+## Remote commands (`ssh_bash`)
+
+Runs a command on the remote over the shared connection. For **long-running**
+work (downloads, training, dev servers) prefer `ssh_process`: an `ssh_bash`
+`timeout` kills the local SSH client, which closes the channel and the remote
+command is most likely terminated by `SIGHUP`. On timeout `ssh_bash` now returns
+an explicit message saying it *was* a timeout, what it did to the remote, and to
+re-run under `ssh_process` instead — no more ambiguous "Command aborted".
+
+**Long output is consistent with the local `read`/`bash` tools.** `ssh_read`
+takes `offset`/`limit` like local `read`. `ssh_bash` inherits the local bash
+truncation: output over ~50KB / 2000 lines is tail-truncated and the **full**
+output is spilled to a **local** temp file (`/tmp/pi-bash-*.log`), shown as a
+`Full output: …` footer. Page that file with the local `read` tool's
+`offset`/`limit` rather than re-running the command, and scope commands with
+`head`/`tail`/`grep`/`sed` when you only need part. No remote-specific output
+cap or extra params — the behavior mirrors the built-in tools exactly.
+
+## Secrets (`ssh_secret_write`)
+
+Write a secret to a remote file **without the value entering the tool-call
+record**. The value is read locally from an env var or a local file and streamed
+to the remote over stdin; only the name/path and destination are logged. The
+remote file is created under `umask 077` (never briefly world-readable) and
+`chmod`ed to `0600` by default.
+
+```
+ssh_secret_write remotePath=.env.key fromEnv=PIONEER_API_KEY
+ssh_secret_write remotePath=/srv/app/token fromFile=./secret.txt mode=640
+```
+
+Use this for API keys / tokens / credentials instead of `ssh_write` or
+`ssh_bash` (whose arguments are recorded).
+
 ## Background jobs (`ssh_process`)
 
 `start | list | output | logs | kill | clear`. Jobs run under
@@ -54,6 +119,12 @@ never loop on `list`/`output`:
   (`0` success / `>=128` or missing `exit_code` killed / other failure).
 - `logWatches: [{ pattern, stream?, repeat? }]` — fire when a remote log line
   matches a regex (`stream` default `both`, `repeat` default one-shot).
+
+Completion notifications report the run duration and, when a **newer run of the
+same `name`** was started after this one, tag the alert
+`[superseded: a newer run of this name was started after it]` — so a late
+failure alert from an obsolete run is not confused with the current one in
+parallel multi-run workflows.
 
 The remote job itself runs via `nohup setsid`, so it keeps running regardless of
 the local machine. **Mac sleep is safe:** the poller is a local timer that simply
@@ -79,11 +150,16 @@ better than re-polling `output` to watch progress.
 ## Transfer (`ssh_push` / `ssh_pull`)
 
 rsync over the shared connection. `ssh_push` is `.gitignore`-filtered. Both
-stream live progress and accept `dryRun: true` to preview a transfer (handy
-before pushing a large tree) without writing. The progress flag is chosen by
-local rsync version — `--info=progress2` on rsync ≥ 3.1, `--progress` on the
-rsync 2.6.9 Apple ships by default (so push/pull work out of the box on stock
-macOS). Missing rsync gives an actionable error (`brew install rsync`).
+accept `dryRun: true` to preview a transfer (handy before pushing a large tree)
+without writing.
+
+By **default** the result is a single-line summary (files transferred, bytes,
+elapsed) so a large push does not flood the agent context. Pass `verbose: true`
+for the full per-file itemized list with live progress streaming. The progress
+flag is chosen by local rsync version — `--info=progress2` on rsync ≥ 3.1,
+`--progress` on the rsync 2.6.9 Apple ships by default (so push/pull work out of
+the box on stock macOS). Missing rsync gives an actionable error
+(`brew install rsync`).
 
 ## Auto-sync (`ssh_sync`)
 
@@ -106,6 +182,25 @@ ssh_tunnel open  localPort=9000 remotePort=6006   # TensorBoard
 ssh_tunnel list
 ssh_tunnel close localPort=8080
 ```
+
+## Tool-call titles
+
+Every `ssh_*` tool renders a rich one-line title that reads like the local tool:
+the `[root@host]` badge first (in `muted`), then the **local** tool label
+(`read`/`edit`/`ls`/`$`/… in `toolTitle` bold), the path/command argument in
+`accent`, and the read line-range in `warning`:
+
+```
+[root@host] read src/agents/openclaw/eval/types.py:100-139
+[root@host] edit src/agents/openclaw/eval/types.py (2 edits)   → result: +12 -3 colored diff
+[root@host] $ pytest -q tests/ (timeout 60s)
+[root@host] process start "train" $ python train.py
+```
+
+`ssh_read` reuses the local read result renderer (syntax highlight + truncation
+note); `ssh_edit` shows a colored `+adds -dels` diff parsed from the remote patch.
+The host tag and remote-relative paths come from the live connection at render
+time (best-effort; never throws if disconnected).
 
 ## Design notes
 

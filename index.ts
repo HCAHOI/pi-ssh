@@ -47,6 +47,7 @@ import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:p
 import { randomBytes } from "node:crypto";
 import { Type } from "typebox";
 import type { AgentToolUpdateCallback, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Container, Key, matchesKey, type SelectItem, SelectList, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import {
 	type BashOperations,
 	createBashTool,
@@ -55,6 +56,7 @@ import {
 	createGrepTool,
 	createLsTool,
 	createReadTool,
+	createReadToolDefinition,
 	createWriteTool,
 	type EditOperations,
 	type FindOperations,
@@ -111,6 +113,9 @@ interface PollerState {
 	timer: NodeJS.Timeout | null;
 	busy: boolean;
 	finished: boolean;
+	/** Epoch ms when this poller started tracking the job. Known for fresh starts
+	 * (used to report run duration); absent for jobs rehydrated after a restart. */
+	startedAt?: number;
 }
 
 interface Activation {
@@ -191,6 +196,34 @@ function shQuote(value: string): string {
 
 function stripTrailingSlash(value: string): string {
 	return value.length > 1 ? value.replace(/\/+$/, "") : value;
+}
+
+function formatDuration(ms: number): string {
+	const s = Math.round(ms / 1000);
+	if (s < 60) return `${s}s`;
+	const m = Math.floor(s / 60);
+	const rem = s % 60;
+	if (m < 60) return rem ? `${m}m${rem}s` : `${m}m`;
+	const h = Math.floor(m / 60);
+	return `${h}h${m % 60}m`;
+}
+
+// Condense rsync --stats output into a single line so a large transfer does not
+// flood the agent context. Falls back to the provided message when the stats
+// block is absent (e.g. nothing changed).
+function summarizeRsync(stdout: string, fallback: string): string {
+	const grab = (re: RegExp): string | null => {
+		const m = stdout.match(re);
+		return m ? m[1].trim() : null;
+	};
+	const transferred = grab(/Number of regular files transferred:\s*([\d,]+)/i);
+	const size = grab(/Total transferred file size:\s*([\d.,]+[KMGTP]?)\s*bytes/i);
+	const sent = grab(/Total bytes sent:\s*([\d.,]+[KMGTP]?)\s*bytes/i);
+	if (transferred === null && size === null) return fallback;
+	const parts: string[] = [`${transferred ?? "?"} file(s) transferred`];
+	if (size) parts.push(`${size} bytes`);
+	if (sent) parts.push(`sent ${sent} bytes`);
+	return parts.join(", ");
 }
 
 const fileLocks = new Map<string, Promise<void>>();
@@ -645,6 +678,9 @@ export default function (pi: ExtensionAPI) {
 
 	const localCwd = process.cwd();
 	const localRead = createReadTool(localCwd);
+	// Definition (not the wrapped tool) so we can reuse its renderResult for ssh_read:
+	// it formats the returned content with syntax highlight and does no fs access.
+	const localReadDef = createReadToolDefinition(localCwd);
 	const localWrite = createWriteTool(localCwd);
 	const localEdit = createEditTool(localCwd);
 	const localFind = createFindTool(localCwd);
@@ -661,10 +697,50 @@ export default function (pi: ExtensionAPI) {
 		return `SSH: ${t.remote}:${t.remoteCwd}${t.hasPython ? "" : " (no python3)"}${act}`;
 	}
 
+	// Last seen ui handle, captured from any ctx, so the connection-level widget
+	// poller can update the footer widget without a live command/tool ctx.
+	let uiRef: { setStatus: (k: string, v?: string) => void; setWidget: (k: string, v?: unknown, o?: unknown) => void; theme: { fg: (c: string, s: string) => string } } | null = null;
+	let widgetTimer: NodeJS.Timeout | null = null;
+	const WIDGET_POLL_MS = 5000;
+
+	function stopWidgetPoller(): void {
+		if (widgetTimer) {
+			clearInterval(widgetTimer);
+			widgetTimer = null;
+		}
+		uiRef?.setWidget("ssh-procs", undefined);
+	}
+
+	function startWidgetPoller(): void {
+		if (widgetTimer || !uiRef) return;
+		let busy = false;
+		const tickWidget = async () => {
+			if (busy || !target || !uiRef) return;
+			busy = true;
+			try {
+				const rows = await listProcesses(target);
+				const running = rows.filter((r) => r.status === "running").length;
+				uiRef.setWidget("ssh-procs", running > 0 ? [uiRef.theme.fg("accent", `ssh: ${running} running`)] : undefined);
+			} catch {
+				/* transient: keep the last widget value, retry next tick */
+			} finally {
+				busy = false;
+			}
+		};
+		widgetTimer = setInterval(() => void tickWidget(), WIDGET_POLL_MS);
+		widgetTimer.unref?.();
+		void tickWidget();
+	}
+
 	function refreshStatus(ctx: any) {
-		if (!ctx?.ui) return;
-		const label = statusLabel(target);
-		ctx.ui.setStatus("ssh", label ? ctx.ui.theme.fg("accent", label) : "");
+		if (ctx?.ui) uiRef = ctx.ui;
+		if (uiRef) {
+			const label = statusLabel(target);
+			uiRef.setStatus("ssh", label ? uiRef.theme.fg("accent", label) : "");
+		}
+		// Drive the running-process widget by connection state.
+		if (target && uiRef) startWidgetPoller();
+		else stopWidgetPoller();
 	}
 
 	function tokenizeSshArgs(input: string): string[] {
@@ -836,6 +912,11 @@ export default function (pi: ExtensionAPI) {
 
 	// --- ssh_process background notification poller (Phase 1) ---
 	const pollers = new Map<string, PollerState>();
+	// Most-recent start per job name. Lets a late completion notification flag that a
+	// newer run of the same name was started after it, so the agent can tell stale
+	// (superseded) alerts from current ones in parallel multi-run workflows. Survives
+	// the finished poller's removal from `pollers`.
+	const latestStartByName = new Map<string, string>();
 
 	function stopPoller(procId: string): void {
 		const p = pollers.get(procId);
@@ -933,12 +1014,17 @@ export default function (pi: ExtensionAPI) {
 		const tail = tr && tr.code === 0 ? tr.stdout.toString().trimEnd() : "";
 		const emoji = outcome === "success" ? "✅" : outcome === "killed" ? "⛔" : "❌";
 		const codeLabel = code === null ? "" : ` (exit ${code})`;
-		emit(`${emoji} ssh_process "${p.name}" (${p.procId}) ${outcome}${codeLabel}.${tail ? `\n${tail}` : ""}`, {
+		const latest = latestStartByName.get(p.name);
+		const superseded = latest !== undefined && latest !== p.procId;
+		const supersedeLabel = superseded ? " [superseded: a newer run of this name was started after it]" : "";
+		const ageLabel = p.startedAt ? ` after ${formatDuration(Date.now() - p.startedAt)}` : "";
+		emit(`${emoji} ssh_process "${p.name}" (${p.procId})${supersedeLabel} ${outcome}${codeLabel}${ageLabel}.${tail ? `\n${tail}` : ""}`, {
 			kind: "completion",
 			procId: p.procId,
 			name: p.name,
 			outcome,
 			code,
+			superseded,
 		});
 	}
 
@@ -987,6 +1073,8 @@ export default function (pi: ExtensionAPI) {
 		 * reconnect/restart: seek to current EOF so historical log lines are not
 		 * re-matched (only completion + new lines fire). */
 		offsets?: { stdout: number; stderr: number };
+		/** Epoch ms of the fresh start (for run-duration reporting); omit for rehydrate. */
+		startedAt?: number;
 	}): void {
 		if (!args.alertOnSuccess && !args.alertOnFailure && !args.alertOnKill && args.watches.length === 0) return;
 		if (pollers.has(args.procId)) return; // already tracked
@@ -1150,6 +1238,94 @@ print(json.dumps(out))
 		return parts.join("\n");
 	}
 
+	// ---------------------------------------------------------------------------
+	// Tool-call rendering helpers (renderCall titles like `ssh_read [host] path:lines`)
+	// ---------------------------------------------------------------------------
+	function str(v: unknown): string {
+		return typeof v === "string" ? v : "";
+	}
+
+	function resultText(r: any): string {
+		return (r?.content ?? []).map((c: any) => (c?.type === "text" ? c.text : "")).join("");
+	}
+
+	// Remote path shown relative to remoteCwd (best-effort; never throws).
+	function remoteDisplayPath(raw: string): string {
+		const t = target;
+		if (!t) return raw;
+		try {
+			const rp = toRemotePath(raw, localCwd, t.remoteCwd);
+			const base = stripTrailingSlash(t.remoteCwd);
+			if (rp === base) return ".";
+			if (rp.startsWith(`${base}/`)) return rp.slice(base.length + 1);
+			return rp;
+		} catch {
+			return raw;
+		}
+	}
+
+	function accentRemotePath(raw: unknown, theme: any): string {
+		const p = str(raw);
+		return p ? theme.fg("accent", remoteDisplayPath(p)) : theme.fg("toolOutput", "...");
+	}
+
+	// Mirrors the SDK read tool's line-range suffix from {offset,limit}.
+	function readLineRange(args: { offset?: number; limit?: number }, theme: any): string {
+		if (args?.offset === undefined && args?.limit === undefined) return "";
+		const startLine = args.offset ?? 1;
+		const endLine = args.limit !== undefined ? startLine + args.limit - 1 : "";
+		return theme.fg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
+	}
+
+	function hostTag(theme: any): string {
+		const t = target;
+		return t ? theme.fg("muted", `[${t.remote}]`) : "";
+	}
+
+	// Build the one-line tool-call title, reusing the prior Text component.
+	// `[host] <label> <rest>` — host badge first, then the local tool's own short
+	// label (read/edit/ls/...) so remote calls read like the local ones. bash passes
+	// an empty label (the `$ cmd` is the label, as in the local bash tool).
+	function sshTitle(label: string, rest: string, theme: any, context: any): Text {
+		const text: Text = context?.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+		const name = label ? theme.fg("toolTitle", theme.bold(label)) : "";
+		text.setText([hostTag(theme), name, rest].filter((s) => s && s.length > 0).join(" "));
+		return text;
+	}
+
+	// Colored unified-diff result for ssh_edit (parses details.diff produced remotely).
+	function renderEditDiffResult(result: any, theme: any, context: any): Container | Text {
+		if (context?.isError) {
+			const t = context?.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+			t.setText(theme.fg("error", resultText(result) || "edit failed"));
+			return t;
+		}
+		const diff = typeof result?.details?.diff === "string" ? result.details.diff : "";
+		const lines = diff ? diff.split("\n") : [];
+		let adds = 0;
+		let dels = 0;
+		for (const l of lines) {
+			if (l.startsWith("+") && !l.startsWith("+++")) adds++;
+			else if (l.startsWith("-") && !l.startsWith("---")) dels++;
+		}
+		const container = new Container();
+		const header = adds || dels ? `${theme.fg("toolDiffAdded", `+${adds}`)} ${theme.fg("toolDiffRemoved", `-${dels}`)}` : theme.fg("muted", "(no textual changes)");
+		container.addChild(new Text(header, 0, 0));
+		const MAX = 40;
+		let shown = 0;
+		for (const l of lines) {
+			if (l.startsWith("+++") || l.startsWith("---") || l.startsWith("@@") || l.startsWith("diff ")) continue;
+			if (shown >= MAX) {
+				container.addChild(new Text(theme.fg("dim", `\u2026 (${lines.length} diff lines total)`), 0, 0));
+				break;
+			}
+			const colored = l.startsWith("+") ? theme.fg("toolDiffAdded", l) : l.startsWith("-") ? theme.fg("toolDiffRemoved", l) : theme.fg("toolDiffContext", l);
+			container.addChild(new Text(colored, 0, 0));
+			shown++;
+		}
+		return container;
+	}
+
 	// --- agent-callable connection management ---
 	pi.registerTool({
 		name: "ssh_connect",
@@ -1163,6 +1339,9 @@ print(json.dumps(out))
 		parameters: Type.Object({
 			target: Type.String({ description: "SSH target, e.g. '-i /path/key.pem root@host', 'user@host:/absolute/path', a saved profile '@name', or with persistent setup: 'root@host:/work --activate \"source .venv/bin/activate\" --env PYTHONPATH=/src'" }),
 		}),
+		renderCall(args: any, theme: any, context: any) {
+			return sshTitle("connect", theme.fg("accent", str(args?.target)), theme, context);
+		},
 		async execute(_id, params: { target: string }, _signal, _onUpdate, ctx) {
 			const next = await switchTarget(params.target);
 			refreshStatus(ctx);
@@ -1176,6 +1355,9 @@ print(json.dumps(out))
 		description: "Disconnect the active SSH remote. Local tools are unaffected.",
 		promptSnippet: "Disconnect the active SSH remote",
 		parameters: Type.Object({}),
+		renderCall(_args: any, theme: any, context: any) {
+			return sshTitle("disconnect", "", theme, context);
+		},
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
 			await disconnect();
 			refreshStatus(ctx);
@@ -1189,6 +1371,9 @@ print(json.dumps(out))
 		description: "Show the active SSH remote used by ssh_* tools.",
 		promptSnippet: "Show active SSH connection status",
 		parameters: Type.Object({}),
+		renderCall(_args: any, theme: any, context: any) {
+			return sshTitle("status", "", theme, context);
+		},
 		async execute() {
 			const base = target ? connectedText(target) : "SSH: not connected";
 			let profiles: string[] = [];
@@ -1205,7 +1390,14 @@ print(json.dumps(out))
 		label: "ssh_read",
 		description: `Read a file from the active SSH remote. Relative paths are resolved under the remote cwd. Use local read for local files. ${localRead.description}`,
 		promptSnippet: "Read files from the active SSH remote",
-		promptGuidelines: ["Use ssh_read only for remote files. Use read for local files in the current local workspace."],
+		promptGuidelines: [
+			"Use ssh_read only for remote files. Use read for local files in the current local workspace.",
+			"For large remote files, page with offset/limit rather than reading the whole file (same as the local read tool) so you do not flood context.",
+		],
+		renderCall(args: any, theme: any, context: any) {
+			return sshTitle("read", `${accentRemotePath(args?.path, theme)}${readLineRange(args, theme)}`, theme, context);
+		},
+		renderResult: localReadDef.renderResult,
 		async execute(id, params, signal, onUpdate, _ctx) {
 			const t = requireTarget();
 			const tool = createReadTool(localCwd, { operations: createRemoteReadOps(t, localCwd) });
@@ -1221,6 +1413,9 @@ print(json.dumps(out))
 		description: `List directory contents on the active SSH remote. Relative paths are resolved under the remote cwd. Use local ls/find for local files. ${localLs.description}`,
 		promptSnippet: "List directories on the active SSH remote",
 		promptGuidelines: ["Use ssh_ls only for remote directory listings. Use local ls/find tools for local workspace exploration."],
+		renderCall(args: any, theme: any, context: any) {
+			return sshTitle("ls", accentRemotePath(args?.path, theme), theme, context);
+		},
 		async execute(id, params, signal, onUpdate, _ctx) {
 			const t = requireTarget();
 			const tool = createLsTool(localCwd, { operations: createRemoteLsOps(t, localCwd) });
@@ -1236,6 +1431,11 @@ print(json.dumps(out))
 		description: `Find files on the active SSH remote. Relative paths are resolved under the remote cwd. Use local find for local files. ${localFind.description}`,
 		promptSnippet: "Find files on the active SSH remote",
 		promptGuidelines: ["Use ssh_find only for remote file discovery. Use local find/fffind for local workspace files."],
+		renderCall(args: any, theme: any, context: any) {
+			const pat = theme.fg("accent", str(args?.pattern) || "...");
+			const where = args?.path ? ` ${theme.fg("muted", `in ${remoteDisplayPath(str(args.path))}`)}` : "";
+			return sshTitle("find", `${pat}${where}`, theme, context);
+		},
 		async execute(id, params, signal, onUpdate, _ctx) {
 			const t = requireTarget();
 			const tool = createFindTool(localCwd, { operations: createRemoteFindOps(t, localCwd) });
@@ -1251,6 +1451,11 @@ print(json.dumps(out))
 		description: `Search file contents on the active SSH remote. Relative paths are resolved under the remote cwd. Uses remote rg when available, otherwise grep. Use local grep for local files. ${localGrep.description}`,
 		promptSnippet: "Search file contents on the active SSH remote",
 		promptGuidelines: ["Use ssh_grep only for remote content search. Use local grep/ffgrep for local workspace files."],
+		renderCall(args: any, theme: any, context: any) {
+			const pat = theme.fg("accent", str(args?.pattern) || "...");
+			const where = args?.path ? ` ${theme.fg("muted", `in ${remoteDisplayPath(str(args.path))}`)}` : "";
+			return sshTitle("grep", `${pat}${where}`, theme, context);
+		},
 		async execute(
 			_id,
 			params: { pattern: string; path?: string; glob?: string; ignoreCase?: boolean; literal?: boolean; context?: number; limit?: number },
@@ -1270,10 +1475,61 @@ print(json.dumps(out))
 		description: `Write a file on the active SSH remote. Relative paths are resolved under the remote cwd. Use local write for local files. ${localWrite.description}`,
 		promptSnippet: "Write files on the active SSH remote",
 		promptGuidelines: ["Use ssh_write only for remote files. Use write for local files in the current local workspace."],
+		renderCall(args: any, theme: any, context: any) {
+			return sshTitle("write", accentRemotePath(args?.path, theme), theme, context);
+		},
 		async execute(id, params, signal, onUpdate, _ctx) {
 			const t = requireTarget();
 			const tool = createWriteTool(localCwd, { operations: createRemoteWriteOps(t, localCwd) });
 			return tool.execute(id, params, signal, onUpdate, _ctx);
+		},
+	});
+
+	// --- remote secret write (value never enters the tool-call record) ---
+	pi.registerTool({
+		name: "ssh_secret_write",
+		label: "ssh_secret_write",
+		description: "Write a secret to a remote file WITHOUT the value passing through the tool-call log. The value is read locally from an environment variable (fromEnv) or a local file (fromFile) and streamed to the remote over stdin; only the name/path and destination are recorded. The remote file is created with mode 0600 by default (created under umask 077 so it is never briefly world-readable). Use this instead of ssh_write/ssh_bash for API keys, tokens, and credentials.",
+		promptSnippet: "Write a secret to a remote file without logging its value",
+		promptGuidelines: [
+			"Use ssh_secret_write for API keys/tokens/credentials so the value never enters the tool-call record. Pass the LOCAL env var name (fromEnv) or local file path (fromFile), never the secret literal. Do not paste secrets into ssh_write/ssh_bash.",
+		],
+		parameters: Type.Object({
+			remotePath: Type.String({ description: "Destination path on the remote (absolute, or relative to remote cwd)" }),
+			fromEnv: Type.Optional(Type.String({ description: "Name of a LOCAL environment variable holding the secret value" })),
+			fromFile: Type.Optional(Type.String({ description: "Path to a LOCAL file whose contents are the secret value" })),
+			mode: Type.Optional(Type.String({ description: "Octal file mode for the remote file (default 600)" })),
+			appendNewline: Type.Optional(Type.Boolean({ description: "Append a trailing newline to the value (default false)" })),
+		}),
+		renderCall(args: any, theme: any, context: any) {
+			const src = args?.fromEnv ? `\u2190 $${args.fromEnv}` : args?.fromFile ? `\u2190 ${args.fromFile}` : "";
+			const rest = `${accentRemotePath(args?.remotePath, theme)}${src ? ` ${theme.fg("muted", src)}` : ""}`;
+			return sshTitle("secret", rest, theme, context);
+		},
+		async execute(_id, params: { remotePath: string; fromEnv?: string; fromFile?: string; mode?: string; appendNewline?: boolean }) {
+			const t = requireTarget();
+			if ((params.fromEnv ? 1 : 0) + (params.fromFile ? 1 : 0) !== 1) {
+				throw new Error("ssh_secret_write requires exactly one of fromEnv or fromFile");
+			}
+			let value: Buffer;
+			if (params.fromEnv) {
+				const v = process.env[params.fromEnv];
+				if (v === undefined) throw new Error(`Local environment variable not set: ${params.fromEnv}`);
+				value = Buffer.from(v);
+			} else {
+				value = readFileSync(resolve(localCwd, params.fromFile!));
+			}
+			if (params.appendNewline) value = Buffer.concat([value, Buffer.from("\n")]);
+			const mode = params.mode?.trim() || "600";
+			if (!/^[0-7]{3,4}$/.test(mode)) throw new Error(`Invalid octal mode: ${mode}`);
+			const remotePath = toRemotePath(params.remotePath, localCwd, t.remoteCwd);
+			const q = shQuote(remotePath);
+			// umask 077 makes the create restrictive from the first byte; chmod sets the
+			// final mode. The secret arrives only on stdin, never in argv.
+			const cmd = `mkdir -p -- "$(dirname ${q})" && ( umask 077 && cat > ${q} ) && chmod ${mode} ${q}`;
+			const r = await withFileLock(`${t.remote}:${remotePath}`, () => runRemoteCommand(t, cmd, { stdin: value }));
+			if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
+			return { content: [{ type: "text" as const, text: `Wrote secret (${value.length} bytes) to ${t.remote}:${remotePath} (mode ${mode}). Value not recorded.` }] };
 		},
 	});
 
@@ -1285,6 +1541,14 @@ print(json.dumps(out))
 		description: `Edit a file on the active SSH remote. Relative paths are resolved under the remote cwd. Use local edit for local files. ${localEdit.description}`,
 		promptSnippet: "Edit files on the active SSH remote",
 		promptGuidelines: ["Use ssh_edit only for remote files. Use edit for local files in the current local workspace."],
+		renderCall(args: any, theme: any, context: any) {
+			const n = Array.isArray(args?.edits) ? args.edits.length : 0;
+			const count = theme.fg("muted", `(${n} edit${n === 1 ? "" : "s"})`);
+			return sshTitle("edit", `${accentRemotePath(args?.path, theme)} ${count}`, theme, context);
+		},
+		renderResult(result: any, _options: any, theme: any, context: any) {
+			return renderEditDiffResult(result, theme, context);
+		},
 		async execute(id, params: { path: string; edits: Array<{ oldText: string; newText: string }> }, signal, onUpdate, _ctx) {
 			const t = requireTarget();
 			const remotePath = toRemotePath(params.path, localCwd, t.remoteCwd);
@@ -1325,6 +1589,8 @@ print(json.dumps(out))
 		promptSnippet: "Execute bash commands on the active SSH remote",
 		promptGuidelines: [
 			"Use ssh_bash for remote testing or GPU/server commands. Use bash for local commands and local file operations.",
+			"For long-running work (downloads, training, dev servers), prefer ssh_process. An ssh_bash timeout closes the SSH connection and the remote command is likely terminated (SIGHUP); ssh_process survives disconnects and notifies you on completion.",
+			"Large remote output is truncated to the last 50KB and the FULL output is saved to a local temp file (footer 'Full output: /tmp/pi-bash-*.log'); page that file with the local read tool's offset/limit instead of re-running the command — and scope commands with head/tail/grep/sed when you only need part.",
 		],
 		parameters: Type.Object({
 			command: Type.String({ description: "Bash command to execute on the active SSH remote" }),
@@ -1335,6 +1601,12 @@ print(json.dumps(out))
 			commandPrefix: Type.Optional(Type.String({ description: "Shell code run before command, e.g. 'source .venv/bin/activate'" })),
 			tty: Type.Optional(Type.Boolean({ description: "Allocate a remote pty (ssh -tt) for commands that need a terminal (progress bars, some CLIs). Default false." })),
 		}),
+		renderCall(args: any, theme: any, context: any) {
+			const cmd = str(args?.command);
+			const body = cmd ? theme.fg("toolTitle", theme.bold(`$ ${cmd}`)) : theme.fg("toolOutput", "$ ...");
+			const timeout = args?.timeout ? theme.fg("muted", ` (timeout ${args.timeout}s)`) : "";
+			return sshTitle("", `${body}${timeout}`, theme, context);
+		},
 		async execute(
 			id,
 			params: { command: string; timeout?: number; cwd?: string; delaySeconds?: number; env?: Record<string, string>; commandPrefix?: string; tty?: boolean },
@@ -1344,18 +1616,92 @@ print(json.dumps(out))
 		) {
 			const t = requireTarget();
 			const tool = createBashTool(localCwd, { operations: createRemoteBashOps(t, localCwd, { tty: params.tty }) });
-			return tool.execute(
-				id,
-				{ command: buildSshBashCommand(t, params), timeout: params.timeout },
-				signal,
-				onUpdate,
-				_ctx,
-			);
+			try {
+				return await tool.execute(
+					id,
+					{ command: buildSshBashCommand(t, params), timeout: params.timeout },
+					signal,
+					onUpdate,
+					_ctx,
+				);
+			} catch (e) {
+				// Make the timeout outcome unambiguous: say it WAS a timeout, what it did
+				// to the remote, and what to use instead. The SDK formats the timeout as
+				// "Command timed out after N seconds"; we append the consequence + remedy.
+				const msg = e instanceof Error ? e.message : String(e);
+				if (/Command timed out after/.test(msg)) {
+					throw new Error(
+						`${msg}\n[ssh_bash] The timeout closed the local SSH connection, so the remote command was most likely terminated (SIGHUP). If it must keep running, re-run it with ssh_process (it survives disconnects and notifies you on completion) rather than ssh_bash with a timeout.`,
+					);
+				}
+				throw e;
+			}
 		},
 	});
 
 	function processRoot(t: SshTarget): string {
 		return `${t.remoteCwd}/.pi-ssh-processes`;
+	}
+
+	// --- shared process queries (used by ssh_process AND the /ssh dashboard) ---
+	interface ProcRow {
+		id: string;
+		name: string;
+		status: "running" | "exited";
+		code: number | null;
+		pid: string;
+		/** Epoch ms decoded from the id prefix (base36 Date.now() at start), or null. */
+		startedMs: number | null;
+	}
+
+	// Single source of truth for the process listing. The structured parse below and
+	// the ssh_process `list` text output both derive from this one command.
+	function buildProcessListCommand(root: string): string {
+		return `root=${shQuote(root)}; if [ ! -d "$root" ]; then echo 'No remote processes.'; exit 0; fi; found=0; for d in "$root"/*; do [ -d "$d" ] || continue; found=1; id=$(basename "$d"); pid=$(cat "$d/pid" 2>/dev/null || true); name=$(cat "$d/name" 2>/dev/null || true); if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then status=running; code='-'; else status=exited; code=$(cat "$d/exit_code" 2>/dev/null || true); [ -n "$code" ] || code='?'; fi; printf '%s\t%s\texit=%s\tpid=%s\t%s\n' "$id" "$status" "$code" "$pid" "$name"; done; [ "$found" -eq 0 ] && echo 'No remote processes.' || true`;
+	}
+
+	function parseProcRows(text: string): ProcRow[] {
+		const rows: ProcRow[] = [];
+		for (const line of text.split("\n")) {
+			if (!line.trim() || line.trim() === "No remote processes.") continue;
+			const parts = line.split("\t");
+			if (parts.length < 5) continue;
+			const [id, statusRaw, exitField, pidField] = parts;
+			const name = parts.slice(4).join("\t");
+			const status = statusRaw === "running" ? "running" : "exited";
+			const codeStr = exitField.startsWith("exit=") ? exitField.slice(5) : "";
+			const code = status === "running" || codeStr === "?" || codeStr === "-" || codeStr === "" ? null : Number.parseInt(codeStr, 10);
+			const pid = pidField.startsWith("pid=") ? pidField.slice(4) : pidField;
+			const base = id.split("-")[0];
+			const ms = Number.parseInt(base, 36);
+			rows.push({ id, name, status, code: Number.isNaN(code as number) ? null : code, pid, startedMs: Number.isNaN(ms) ? null : ms });
+		}
+		return rows;
+	}
+
+	// Reproduce the exact ssh_process `list` text from structured rows, byte-identical
+	// to the legacy inline command output (so the agent-facing tool is unchanged).
+	function formatProcRows(rows: ProcRow[]): string {
+		return rows
+			.map((r) => {
+				const code = r.status === "running" ? "-" : r.code === null ? "?" : String(r.code);
+				return `${r.id}\t${r.status}\texit=${code}\tpid=${r.pid}\t${r.name}`;
+			})
+			.join("\n");
+	}
+
+	async function listProcesses(t: SshTarget, signal?: AbortSignal): Promise<ProcRow[]> {
+		const r = await runRemoteCommand(t, buildProcessListCommand(processRoot(t)), { signal });
+		if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
+		return parseProcRows(r.stdout.toString());
+	}
+
+	function buildKillCommand(dir: string): string {
+		return `d=${shQuote(dir)}; test -d "$d" || { echo 'process not found' >&2; exit 2; }; pid=$(cat "$d/pid" 2>/dev/null || true); test -n "$pid" || { echo 'pid not found' >&2; exit 2; }; kill "$pid" 2>/dev/null || true; sleep 1; kill -9 "$pid" 2>/dev/null || true; printf 'killed %s\n' "$pid"`;
+	}
+
+	function buildClearCommand(root: string): string {
+		return `root=${shQuote(root)}; if [ ! -d "$root" ]; then echo 'No remote processes.'; exit 0; fi; removed=0; kept=0; for d in "$root"/*; do [ -d "$d" ] || continue; pid=$(cat "$d/pid" 2>/dev/null || true); if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then kept=$((kept+1)); continue; fi; rm -rf "$d" && removed=$((removed+1)); done; rmdir "$root" 2>/dev/null || true; printf 'Cleared %s finished process(es); %s still running.\n' "$removed" "$kept"`;
 	}
 
 	function processRunScript(t: SshTarget, params: {
@@ -1469,11 +1815,18 @@ print(json.dumps(out))
 		t: SshTarget,
 		source: string,
 		dest: string,
-		opts: { delete?: boolean; dryRun?: boolean; excludes?: string[]; gitignore?: boolean; quiet?: boolean },
+		opts: { delete?: boolean; dryRun?: boolean; excludes?: string[]; gitignore?: boolean; quiet?: boolean; verbose?: boolean },
 		signal?: AbortSignal,
 		onData?: (chunk: Buffer) => void,
-	): Promise<{ stdout: string; stderr: string }> {
-		const progress = opts.quiet ? [] : [await rsyncProgressFlag(), "--itemize-changes", "--human-readable", "--stats"];
+	): Promise<{ stdout: string; stderr: string; elapsedMs: number }> {
+		// quiet   -> no output (ssh_sync background runs)
+		// verbose -> per-file itemized list + progress + full stats (opt-in)
+		// default -> stats only, condensed to one line by the caller (summarizeRsync)
+		const progress = opts.quiet
+			? []
+			: opts.verbose
+				? [await rsyncProgressFlag(), "--itemize-changes", "--human-readable", "--stats"]
+				: ["--human-readable", "--stats"];
 		const args = ["-az", ...progress];
 		if (opts.gitignore) args.push("--filter=:- .gitignore", "--exclude", ".git/");
 		args.push("-e", rsyncSshCommand(t));
@@ -1481,9 +1834,10 @@ print(json.dumps(out))
 		if (opts.delete) args.push("--delete");
 		if (opts.dryRun) args.push("--dry-run");
 		args.push(source, dest);
+		const started = Date.now();
 		const r = await runLocalProcess("rsync", args, signal, onData);
 		if (r.code !== 0) throw new Error(`rsync failed (${r.code ?? "unknown"}): ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
-		return { stdout: r.stdout.toString().trim(), stderr: r.stderr.toString().trim() };
+		return { stdout: r.stdout.toString().trim(), stderr: r.stderr.toString().trim(), elapsedMs: Date.now() - started };
 	}
 
 	pi.registerTool({
@@ -1515,6 +1869,20 @@ print(json.dumps(out))
 				repeat: Type.Optional(Type.Boolean({ description: "Fire every match (default false: one-shot)" })),
 			}), { description: "start: notify when a log line matches; re-engages the agent" })),
 		}),
+		renderCall(args: any, theme: any, context: any) {
+			const a = str(args?.action) || "?";
+			let rest: string;
+			if (a === "start") {
+				const nm = args?.name ? ` ${theme.fg("accent", `"${args.name}"`)}` : "";
+				const cmd = str(args?.command);
+				rest = `${theme.fg("accent", "start")}${nm}${cmd ? ` ${theme.fg("muted", `$ ${cmd}`)}` : ""}`;
+			} else if (a === "kill" || a === "output" || a === "logs" || a === "attach") {
+				rest = `${theme.fg("accent", a)}${args?.id ? ` ${theme.fg("muted", str(args.id))}` : ""}`;
+			} else {
+				rest = theme.fg("accent", a);
+			}
+			return sshTitle("process", rest, theme, context);
+		},
 		async execute(_id, params: {
 			action: "start" | "list" | "output" | "logs" | "kill" | "clear" | "attach";
 			name?: string;
@@ -1563,6 +1931,9 @@ print(json.dumps(out))
 				const r = await runRemoteCommand(t, cmd, { stdin: script, signal });
 				if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
 				const watches: WatchState[] = buildWatchStates(params.logWatches);
+				// Record this as the most recent run of `name` so an older run's late
+				// completion alert can be flagged as superseded.
+				latestStartByName.set(name, procId);
 				startPoller({
 					procId,
 					name,
@@ -1572,6 +1943,7 @@ print(json.dumps(out))
 					alertOnFailure: params.alertOnFailure ?? true,
 					alertOnKill: params.alertOnKill ?? false,
 					watches,
+					startedAt: Date.now(),
 				});
 				// Point-of-need discovery: this job already alerts on failure; nudge the
 				// agent toward success/log-watch notifications only when it did not opt in,
@@ -1584,16 +1956,13 @@ print(json.dumps(out))
 			}
 
 			if (params.action === "list") {
-				const cmd = `root=${shQuote(root)}; if [ ! -d "$root" ]; then echo 'No remote processes.'; exit 0; fi; found=0; for d in "$root"/*; do [ -d "$d" ] || continue; found=1; id=$(basename "$d"); pid=$(cat "$d/pid" 2>/dev/null || true); name=$(cat "$d/name" 2>/dev/null || true); if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then status=running; code='-'; else status=exited; code=$(cat "$d/exit_code" 2>/dev/null || true); [ -n "$code" ] || code='?'; fi; printf '%s\t%s\texit=%s\tpid=%s\t%s\n' "$id" "$status" "$code" "$pid" "$name"; done; [ "$found" -eq 0 ] && echo 'No remote processes.' || true`;
-				const r = await runRemoteCommand(t, cmd, { signal });
-				if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
-				const text = r.stdout.toString().trim() || "No remote processes.";
+				const rows = await listProcesses(t, signal);
+				const text = rows.length ? formatProcRows(rows) : "No remote processes.";
 				return { content: [{ type: "text" as const, text }] };
 			}
 
 			if (params.action === "clear") {
-				const cmd = `root=${shQuote(root)}; if [ ! -d "$root" ]; then echo 'No remote processes.'; exit 0; fi; removed=0; kept=0; for d in "$root"/*; do [ -d "$d" ] || continue; pid=$(cat "$d/pid" 2>/dev/null || true); if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then kept=$((kept+1)); continue; fi; rm -rf "$d" && removed=$((removed+1)); done; rmdir "$root" 2>/dev/null || true; printf 'Cleared %s finished process(es); %s still running.\n' "$removed" "$kept"`;
-				const r = await runRemoteCommand(t, cmd, { signal });
+				const r = await runRemoteCommand(t, buildClearCommand(root), { signal });
 				if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
 				return { content: [{ type: "text" as const, text: r.stdout.toString().trim() }] };
 			}
@@ -1669,8 +2038,7 @@ print(json.dumps(out))
 			// Agent-initiated kill: drop the poller first so it does not fire a
 			// spurious completion/kill notification for an expected teardown.
 			stopPoller(params.id);
-			const cmd = `d=${shQuote(dir)}; test -d "$d" || { echo 'process not found' >&2; exit 2; }; pid=$(cat "$d/pid" 2>/dev/null || true); test -n "$pid" || { echo 'pid not found' >&2; exit 2; }; kill "$pid" 2>/dev/null || true; sleep 1; kill -9 "$pid" 2>/dev/null || true; printf 'killed %s\n' "$pid"`;
-			const r = await runRemoteCommand(t, cmd, { signal });
+			const r = await runRemoteCommand(t, buildKillCommand(dir), { signal });
 			if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
 			return { content: [{ type: "text" as const, text: r.stdout.toString().trim() }] };
 		},
@@ -1688,21 +2056,31 @@ print(json.dumps(out))
 			delete: Type.Optional(Type.Boolean({ description: "Delete remote files absent locally (default false)" })),
 			dryRun: Type.Optional(Type.Boolean({ description: "Preview the transfer without writing (rsync --dry-run). Useful before pushing a large tree." })),
 			excludes: Type.Optional(Type.Array(Type.String(), { description: "Additional rsync exclude patterns" })),
+			verbose: Type.Optional(Type.Boolean({ description: "Stream the full per-file itemized list. Default false: only a one-line summary (files, bytes, time) to save context." })),
 		}),
-		async execute(_id, params: { localPath?: string; remotePath?: string; delete?: boolean; dryRun?: boolean; excludes?: string[] }, signal, onUpdate) {
+		renderCall(args: any, theme: any, context: any) {
+			const from = theme.fg("accent", str(args?.localPath) || ".");
+			const to = theme.fg("accent", args?.remotePath ? remoteDisplayPath(str(args.remotePath)) : "remote cwd");
+			const dry = args?.dryRun ? ` ${theme.fg("muted", "(dry-run)")}` : "";
+			return sshTitle("push", `${from} ${theme.fg("muted", "\u2192")} ${to}${dry}`, theme, context);
+		},
+		async execute(_id, params: { localPath?: string; remotePath?: string; delete?: boolean; dryRun?: boolean; excludes?: string[]; verbose?: boolean }, signal, onUpdate) {
 			const t = requireTarget();
 			const localSource = ensureTrailingSlash(resolve(localCwd, params.localPath ?? "."));
 			const remoteDest = ensureTrailingSlash(params.remotePath ? toRemotePath(params.remotePath, localCwd, t.remoteCwd) : t.remoteCwd);
-			const { stdout } = await runRsyncTransfer(
+			const verbose = params.verbose ?? false;
+			const fallback = `Pushed ${localSource} -> ${t.remote}:${remoteDest}`;
+			const { stdout, elapsedMs } = await runRsyncTransfer(
 				t,
 				localSource,
 				`${t.remote}:${remoteDest}`,
-				{ delete: params.delete, dryRun: params.dryRun, excludes: params.excludes, gitignore: true },
+				{ delete: params.delete, dryRun: params.dryRun, excludes: params.excludes, gitignore: true, verbose },
 				signal,
-				rsyncStreamer(onUpdate),
+				verbose ? rsyncStreamer(onUpdate) : undefined,
 			);
 			const prefix = params.dryRun ? "[dry-run] " : "";
-			return { content: [{ type: "text" as const, text: `${prefix}${stdout || `Pushed ${localSource} -> ${t.remote}:${remoteDest}`}` }] };
+			const body = verbose ? (stdout || fallback) : `${summarizeRsync(stdout, fallback)} in ${formatDuration(elapsedMs)}`;
+			return { content: [{ type: "text" as const, text: `${prefix}${body}` }] };
 		},
 	});
 
@@ -1717,21 +2095,31 @@ print(json.dumps(out))
 			delete: Type.Optional(Type.Boolean({ description: "Delete local files absent remotely (default false; use carefully)" })),
 			dryRun: Type.Optional(Type.Boolean({ description: "Preview the transfer without writing (rsync --dry-run)." })),
 			excludes: Type.Optional(Type.Array(Type.String(), { description: "Additional rsync exclude patterns" })),
+			verbose: Type.Optional(Type.Boolean({ description: "Stream the full per-file itemized list. Default false: only a one-line summary (files, bytes, time) to save context." })),
 		}),
-		async execute(_id, params: { remotePath?: string; localPath?: string; delete?: boolean; dryRun?: boolean; excludes?: string[] }, signal, onUpdate) {
+		renderCall(args: any, theme: any, context: any) {
+			const from = theme.fg("accent", args?.remotePath ? remoteDisplayPath(str(args.remotePath)) : "remote cwd");
+			const to = theme.fg("accent", str(args?.localPath) || ".");
+			const dry = args?.dryRun ? ` ${theme.fg("muted", "(dry-run)")}` : "";
+			return sshTitle("pull", `${from} ${theme.fg("muted", "\u2192")} ${to}${dry}`, theme, context);
+		},
+		async execute(_id, params: { remotePath?: string; localPath?: string; delete?: boolean; dryRun?: boolean; excludes?: string[]; verbose?: boolean }, signal, onUpdate) {
 			const t = requireTarget();
 			const remoteSource = ensureTrailingSlash(params.remotePath ? toRemotePath(params.remotePath, localCwd, t.remoteCwd) : t.remoteCwd);
 			const localDest = ensureTrailingSlash(resolve(localCwd, params.localPath ?? "."));
-			const { stdout } = await runRsyncTransfer(
+			const verbose = params.verbose ?? false;
+			const fallback = `Pulled ${t.remote}:${remoteSource} -> ${localDest}`;
+			const { stdout, elapsedMs } = await runRsyncTransfer(
 				t,
 				`${t.remote}:${remoteSource}`,
 				localDest,
-				{ delete: params.delete, dryRun: params.dryRun, excludes: params.excludes, gitignore: false },
+				{ delete: params.delete, dryRun: params.dryRun, excludes: params.excludes, gitignore: false, verbose },
 				signal,
-				rsyncStreamer(onUpdate),
+				verbose ? rsyncStreamer(onUpdate) : undefined,
 			);
 			const prefix = params.dryRun ? "[dry-run] " : "";
-			return { content: [{ type: "text" as const, text: `${prefix}${stdout || `Pulled ${t.remote}:${remoteSource} -> ${localDest}`}` }] };
+			const body = verbose ? (stdout || fallback) : `${summarizeRsync(stdout, fallback)} in ${formatDuration(elapsedMs)}`;
+			return { content: [{ type: "text" as const, text: `${prefix}${body}` }] };
 		},
 	});
 
@@ -1768,6 +2156,15 @@ print(json.dumps(out))
 			remotePort: Type.Optional(Type.Number({ description: "Remote port to forward (required for open)" })),
 			remoteHost: Type.Optional(Type.String({ description: "Remote-side host the port lives on (default 127.0.0.1)" })),
 		}),
+		renderCall(args: any, theme: any, context: any) {
+			const a = str(args?.action) || "?";
+			if (a === "open" || a === "close") {
+				const lp = args?.localPort ?? args?.remotePort;
+				const spec = `${lp ?? "?"}:${args?.remoteHost ?? "127.0.0.1"}:${args?.remotePort ?? "?"}`;
+				return sshTitle("tunnel", `${theme.fg("accent", a)} ${theme.fg("muted", spec)}`, theme, context);
+			}
+			return sshTitle("tunnel", theme.fg("accent", a), theme, context);
+		},
 		async execute(_id, params: { action: "open" | "close" | "list"; localPort?: number; remotePort?: number; remoteHost?: string }) {
 			const t = requireTarget();
 			if (params.action === "list") {
@@ -1844,6 +2241,36 @@ print(json.dumps(out))
 		s.timer.unref?.();
 	}
 
+	// Start (or restart) the auto-sync watcher. Shared by the ssh_sync tool and the
+	// /ssh dashboard's sync toggle so there is one copy of the rsync+watch setup.
+	async function startSync(
+		t: SshTarget,
+		params: { localPath?: string; remotePath?: string; debounceMs?: number; delete?: boolean; excludes?: string[] },
+	): Promise<{ localSource: string; remoteDest: string; debounceMs: number; initialTail: string }> {
+		stopSyncWatcher();
+		const localSource = ensureTrailingSlash(resolve(localCwd, params.localPath ?? "."));
+		const remoteDest = ensureTrailingSlash(params.remotePath ? toRemotePath(params.remotePath, localCwd, t.remoteCwd) : t.remoteCwd);
+		// Initial full sync so the remote starts in lockstep.
+		const initial = await runRsyncTransfer(t, localSource, `${t.remote}:${remoteDest}`, { delete: params.delete, excludes: params.excludes, gitignore: true }, undefined);
+		const debounceMs = Math.max(50, Math.floor(params.debounceMs ?? 400));
+		let watcher: FSWatcher;
+		try {
+			watcher = watch(resolve(localCwd, params.localPath ?? "."), { recursive: true });
+		} catch (e) {
+			throw new Error(`ssh_sync could not watch ${localSource}: ${e instanceof Error ? e.message : String(e)} (recursive fs.watch requires macOS/Windows; on Linux use ssh_push)`);
+		}
+		const s: SyncState = { watcher, localSource, remoteDest, remote: t.remote, debounceMs, delete: params.delete ?? false, excludes: params.excludes, timer: null, syncing: false, pending: false, count: 0 };
+		watcher.on("change", (_event, file) => {
+			// Cheap noise filter: skip VCS/build churn that rsync would exclude anyway.
+			const name = typeof file === "string" ? file : file?.toString() ?? "";
+			if (/(^|\/)\.git\/|(^|\/)node_modules\/|~$|\.swp$/.test(name)) return;
+			scheduleSync(s);
+		});
+		watcher.on("error", (e) => emit(`⚠️ ssh_sync watcher error: ${e instanceof Error ? e.message : String(e)}`, { kind: "sync-error" }));
+		syncState = s;
+		return { localSource, remoteDest, debounceMs, initialTail: initial.stdout.split("\n").slice(-3).join("\n") };
+	}
+
 	pi.registerTool({
 		name: "ssh_sync",
 		label: "ssh_sync",
@@ -1858,6 +2285,11 @@ print(json.dumps(out))
 			delete: Type.Optional(Type.Boolean({ description: "Mirror local deletions to the remote (default false)" })),
 			excludes: Type.Optional(Type.Array(Type.String(), { description: "Additional rsync exclude patterns" })),
 		}),
+		renderCall(args: any, theme: any, context: any) {
+			const a = str(args?.action) || "?";
+			const where = a === "start" ? ` ${theme.fg("muted", str(args?.localPath) || ".")}` : "";
+			return sshTitle("sync", `${theme.fg("accent", a)}${where}`, theme, context);
+		},
 		async execute(_id, params: { action: "start" | "stop" | "status"; localPath?: string; remotePath?: string; debounceMs?: number; delete?: boolean; excludes?: string[] }) {
 			const t = requireTarget();
 			if (params.action === "status") {
@@ -1870,28 +2302,8 @@ print(json.dumps(out))
 				return { content: [{ type: "text" as const, text: was === null ? "ssh_sync was not running." : `ssh_sync stopped (${was} syncs).` }] };
 			}
 			// start
-			stopSyncWatcher();
-			const localSource = ensureTrailingSlash(resolve(localCwd, params.localPath ?? "."));
-			const remoteDest = ensureTrailingSlash(params.remotePath ? toRemotePath(params.remotePath, localCwd, t.remoteCwd) : t.remoteCwd);
-			// Initial full sync so the remote starts in lockstep.
-			const initial = await runRsyncTransfer(t, localSource, `${t.remote}:${remoteDest}`, { delete: params.delete, excludes: params.excludes, gitignore: true }, undefined);
-			const debounceMs = Math.max(50, Math.floor(params.debounceMs ?? 400));
-			let watcher: FSWatcher;
-			try {
-				watcher = watch(resolve(localCwd, params.localPath ?? "."), { recursive: true });
-			} catch (e) {
-				throw new Error(`ssh_sync could not watch ${localSource}: ${e instanceof Error ? e.message : String(e)} (recursive fs.watch requires macOS/Windows; on Linux use ssh_push)`);
-			}
-			const s: SyncState = { watcher, localSource, remoteDest, remote: t.remote, debounceMs, delete: params.delete ?? false, excludes: params.excludes, timer: null, syncing: false, pending: false, count: 0 };
-			watcher.on("change", (_event, file) => {
-				// Cheap noise filter: skip VCS/build churn that rsync would exclude anyway.
-				const name = typeof file === "string" ? file : file?.toString() ?? "";
-				if (/(^|\/)\.git\/|(^|\/)node_modules\/|~$|\.swp$/.test(name)) return;
-				scheduleSync(s);
-			});
-			watcher.on("error", (e) => emit(`⚠️ ssh_sync watcher error: ${e instanceof Error ? e.message : String(e)}`, { kind: "sync-error" }));
-			syncState = s;
-			return { content: [{ type: "text" as const, text: `ssh_sync started: ${localSource} -> ${t.remote}:${remoteDest} (debounce ${debounceMs}ms).\n${initial.stdout.split("\n").slice(-3).join("\n")}` }] };
+			const { localSource, remoteDest, debounceMs, initialTail } = await startSync(t, params);
+			return { content: [{ type: "text" as const, text: `ssh_sync started: ${localSource} -> ${t.remote}:${remoteDest} (debounce ${debounceMs}ms).\n${initialTail}` }] };
 		},
 	});
 
@@ -1924,6 +2336,360 @@ print(json.dumps(out))
 		return { systemPrompt: event.systemPrompt + guidance };
 	});
 
+	// ---------------------------------------------------------------------------
+	// /ssh interactive dashboard (human-facing TUI; agent tools are unchanged)
+	// ---------------------------------------------------------------------------
+	function padRight(s: string, n: number): string {
+		if (s.length === n) return s;
+		return s.length > n ? s.slice(0, n) : s + " ".repeat(n - s.length);
+	}
+
+	const selectListTheme = (theme: any) => ({
+		selectedPrefix: (t: string) => theme.fg("accent", t),
+		selectedText: (t: string) => theme.fg("accent", t),
+		description: (t: string) => theme.fg("muted", t),
+		scrollInfo: (t: string) => theme.fg("dim", t),
+		noMatch: (t: string) => theme.fg("warning", t),
+	});
+
+	type DashMode = "main" | "connect" | "output";
+	const DASH_MAX_ROWS = 12;
+	const DASH_OUT_MAX_BYTES = 16 * 1024;
+
+	class SshDashboard {
+		private mode: DashMode = "main";
+		private rows: ProcRow[] = [];
+		private sel = 0;
+		private top = 0;
+		private err: string | null = null;
+		private pollTimer: NodeJS.Timeout | null = null;
+		private polling = false;
+		// connect sub-view
+		private connectList: SelectList | null = null;
+		// output sub-view
+		private outId: string | null = null;
+		private outName = "";
+		private outBuf = "";
+		private outAbort: AbortController | null = null;
+
+		constructor(
+			private tui: { requestRender: () => void },
+			private theme: any,
+			private ctx: any,
+			private close: () => void,
+		) {
+			this.pollTimer = setInterval(() => void this.poll(), 2000);
+			this.pollTimer.unref?.();
+			void this.poll();
+		}
+
+		stop(): void {
+			if (this.pollTimer) clearInterval(this.pollTimer);
+			this.pollTimer = null;
+			this.outAbort?.abort();
+			this.outAbort = null;
+		}
+
+		private async poll(force = false): Promise<void> {
+			if ((this.polling && !force) || !target) return;
+			this.polling = true;
+			try {
+				this.rows = await listProcesses(target);
+				this.err = null;
+				if (this.sel >= this.rows.length) this.sel = Math.max(0, this.rows.length - 1);
+			} catch (e) {
+				this.err = e instanceof Error ? e.message : String(e);
+			} finally {
+				this.polling = false;
+				this.tui.requestRender();
+			}
+		}
+
+		// ---- rendering ----
+		private rule(width: number, label?: string): string {
+			if (!label) return this.theme.fg("accent", "\u2500".repeat(Math.max(0, width)));
+			const left = `\u2500\u2500 ${label} `;
+			return this.theme.fg("accent", left + "\u2500".repeat(Math.max(0, width - left.length)));
+		}
+
+		render(width: number): string[] {
+			if (this.mode === "output") return this.renderOutput(width);
+			if (this.mode === "connect") return this.renderConnect(width);
+			return this.renderMain(width);
+		}
+
+		private renderMain(width: number): string[] {
+			const T = this.theme;
+			const out: string[] = [];
+			const push = (s = "") => out.push(truncateToWidth(s, width));
+			push(this.rule(width, "SSH"));
+			const t = target;
+			if (!t) {
+				push("");
+				push(`  ${T.fg("warning", "\u25cb not connected")}`);
+				push("");
+				push(`  ${T.fg("dim", "n connect \u00b7 q close")}`);
+				push(this.rule(width));
+				return out;
+			}
+			push("");
+			push(`  ${T.fg("success", "\u25cf")} ${T.fg("text", "connected")}  ${T.fg("accent", `${t.remote} : ${t.remoteCwd}`)}${t.hasPython ? "" : T.fg("warning", "  (no python3)")}`);
+			if (t.defaultCommandPrefix) push(`    ${T.fg("dim", "\u26a1")} ${T.fg("muted", t.defaultCommandPrefix)}`);
+			if (t.defaultEnv && Object.keys(t.defaultEnv).length) push(`    ${T.fg("dim", "env")}  ${T.fg("muted", Object.keys(t.defaultEnv).join(", "))}`);
+			if (tunnels.size) {
+				const tn = [...tunnels.values()].map((x) => `localhost:${x.localPort}\u2192${x.remoteHost}:${x.remotePort}`).join(", ");
+				push(`    ${T.fg("dim", "tunnels")}  ${T.fg("muted", tn)}`);
+			}
+			if (syncState) push(`    ${T.fg("dim", "sync")}  ${T.fg("muted", `watching ${syncState.localSource} (${syncState.count} syncs)`)}`);
+			push("");
+			const statusHint = this.err ? T.fg("warning", `\u26a0 ${this.err}`) : T.fg("dim", "\u21bb live");
+			push(`  ${T.fg("text", `Processes (${this.rows.length})`)}   ${statusHint}`);
+			if (this.rows.length === 0) {
+				push(`    ${T.fg("dim", "no processes")}`);
+			} else {
+				// window around selection
+				if (this.sel < this.top) this.top = this.sel;
+				if (this.sel >= this.top + DASH_MAX_ROWS) this.top = this.sel - DASH_MAX_ROWS + 1;
+				const end = Math.min(this.rows.length, this.top + DASH_MAX_ROWS);
+				for (let i = this.top; i < end; i++) {
+					const r = this.rows[i];
+					const sel = i === this.sel;
+					const marker = r.status === "running" ? T.fg("success", "\u25cf") : r.code === 0 ? T.fg("success", "\u2713") : T.fg("error", "\u2717");
+					const statusText = r.status === "running" ? "running" : `exited ${r.code ?? "?"}`;
+					const rt = r.status === "running" && r.startedMs ? formatDuration(Date.now() - r.startedMs) : "";
+					const namePart = sel ? T.fg("accent", padRight(r.name, 14)) : T.fg("text", padRight(r.name, 14));
+					const prefix = sel ? T.fg("accent", "> ") : "  ";
+					push(`  ${prefix}${marker} ${namePart} ${T.fg("muted", padRight(statusText, 11))} ${T.fg("dim", padRight(rt, 7))} ${T.fg("dim", `pid ${r.pid}`)}`);
+				}
+				if (end < this.rows.length || this.top > 0) push(`    ${T.fg("dim", `showing ${this.top + 1}-${end} of ${this.rows.length}`)}`);
+			}
+			push("");
+			push(`  ${T.fg("dim", "enter output \u00b7 k kill \u00b7 c clear \u00b7 r refresh")}`);
+			push(`  ${T.fg("dim", "n connect \u00b7 d disconnect \u00b7 w cwd \u00b7 y sync \u00b7 q close")}`);
+			push(this.rule(width));
+			return out;
+		}
+
+		private renderConnect(width: number): string[] {
+			const T = this.theme;
+			const out: string[] = [];
+			out.push(truncateToWidth(this.rule(width, "SSH \u203a connect"), width));
+			if (this.connectList) for (const l of this.connectList.render(width)) out.push(truncateToWidth(l, width));
+			out.push(truncateToWidth(`  ${T.fg("dim", "\u2191\u2193 navigate \u00b7 enter select \u00b7 esc back")}`, width));
+			out.push(truncateToWidth(this.rule(width), width));
+			return out;
+		}
+
+		private renderOutput(width: number): string[] {
+			const T = this.theme;
+			const out: string[] = [];
+			out.push(truncateToWidth(this.rule(width, `output \u203a ${this.outName}`), width));
+			const lines = this.outBuf.split("\n");
+			const visible = lines.slice(-(DASH_MAX_ROWS + 6));
+			if (visible.length === 0 || (visible.length === 1 && visible[0] === "")) out.push(truncateToWidth(`  ${T.fg("dim", "waiting for output\u2026")}`, width));
+			else for (const l of visible) out.push(truncateToWidth(l, width));
+			out.push(truncateToWidth(this.rule(width), width));
+			out.push(truncateToWidth(`  ${T.fg("dim", "esc back \u00b7 streaming live")}`, width));
+			return out;
+		}
+
+		invalidate(): void {
+			this.connectList?.invalidate?.();
+		}
+
+		// ---- input ----
+		handleInput(data: string): void {
+			if (this.mode === "output") return this.handleOutputInput(data);
+			if (this.mode === "connect") return this.handleConnectInput(data);
+			this.handleMainInput(data);
+		}
+
+		private handleMainInput(data: string): void {
+			if (matchesKey(data, Key.up)) {
+				if (this.sel > 0) this.sel--;
+			} else if (matchesKey(data, Key.down)) {
+				if (this.sel < this.rows.length - 1) this.sel++;
+			} else if (matchesKey(data, Key.enter)) {
+				const r = this.rows[this.sel];
+				if (r) this.enterOutput(r);
+			} else if (data === "k") {
+				void this.killSelected();
+			} else if (data === "c") {
+				void this.clearFinished();
+			} else if (data === "r") {
+				void this.poll(true);
+			} else if (data === "n") {
+				this.enterConnect();
+			} else if (data === "d") {
+				void this.doDisconnect();
+			} else if (data === "w") {
+				if (target) {
+					this.ctx.ui.setEditorText("/ssh cd ");
+					this.close();
+				}
+			} else if (data === "y") {
+				void this.toggleSync();
+			} else if (data === "q" || matchesKey(data, Key.escape)) {
+				this.close();
+			}
+		}
+
+		private enterOutput(r: ProcRow): void {
+			const t = target;
+			if (!t) return;
+			this.mode = "output";
+			this.outId = r.id;
+			this.outName = `${r.name} (${r.id})`;
+			this.outBuf = "";
+			this.outAbort = new AbortController();
+			const dir = `${processRoot(t)}/${r.id}`;
+			const ops = createRemoteBashOps(t, localCwd);
+			ops
+				.exec("timeout 3600 tail -n 200 -F stdout.log stderr.log 2>/dev/null", dir, {
+					onData: (d: Buffer) => {
+						this.outBuf += d.toString();
+						if (this.outBuf.length > DASH_OUT_MAX_BYTES) this.outBuf = `\u2026${this.outBuf.slice(-DASH_OUT_MAX_BYTES)}`;
+						this.tui.requestRender();
+					},
+					signal: this.outAbort.signal,
+					timeout: 3600 + 15,
+				})
+				.catch(() => {
+					/* aborted on leaving output, or tail ended: ignore */
+				});
+		}
+
+		private handleOutputInput(data: string): void {
+			if (matchesKey(data, Key.escape) || data === "q") {
+				this.outAbort?.abort();
+				this.outAbort = null;
+				this.outId = null;
+				this.mode = "main";
+				void this.poll(true);
+			}
+		}
+
+		private enterConnect(): void {
+			let names: string[] = [];
+			try {
+				names = profileNames();
+			} catch {
+				/* corrupt profiles file: offer manual connect only */
+			}
+			const items: SelectItem[] = names.map((n) => ({ value: `@${n}`, label: `@${n}`, description: "saved profile" }));
+			items.push({ value: "__new__", label: "type new connection\u2026", description: "prefill /ssh in the editor" });
+			if (target) items.push({ value: "__off__", label: "disconnect", description: "close the active SSH connection" });
+			const list = new SelectList(items, Math.min(items.length, 10), selectListTheme(this.theme));
+			list.onSelect = (item: SelectItem) => void this.onConnectSelect(item.value);
+			list.onCancel = () => {
+				this.mode = "main";
+				this.connectList = null;
+				this.tui.requestRender();
+			};
+			this.connectList = list;
+			this.mode = "connect";
+		}
+
+		private handleConnectInput(data: string): void {
+			this.connectList?.handleInput(data);
+		}
+
+		private async onConnectSelect(value: string): Promise<void> {
+			if (value === "__new__") {
+				this.ctx.ui.setEditorText("/ssh ");
+				this.close();
+				return;
+			}
+			this.mode = "main";
+			this.connectList = null;
+			if (value === "__off__") {
+				await this.doDisconnect();
+				return;
+			}
+			try {
+				await switchTarget(value);
+				refreshStatus({ ui: this.ctx.ui });
+				this.sel = 0;
+				this.top = 0;
+				await this.poll(true);
+			} catch (e) {
+				this.err = e instanceof Error ? e.message : String(e);
+				this.tui.requestRender();
+			}
+		}
+
+		private async doDisconnect(): Promise<void> {
+			await disconnect();
+			refreshStatus({ ui: this.ctx.ui });
+			this.rows = [];
+			this.tui.requestRender();
+		}
+
+		private async killSelected(): Promise<void> {
+			const t = target;
+			const r = this.rows[this.sel];
+			if (!t || !r) return;
+			stopPoller(r.id);
+			try {
+				await runRemoteCommand(t, buildKillCommand(`${processRoot(t)}/${r.id}`));
+			} catch (e) {
+				this.err = e instanceof Error ? e.message : String(e);
+			}
+			await this.poll(true);
+		}
+
+		private async clearFinished(): Promise<void> {
+			const t = target;
+			if (!t) return;
+			try {
+				await runRemoteCommand(t, buildClearCommand(processRoot(t)));
+			} catch (e) {
+				this.err = e instanceof Error ? e.message : String(e);
+			}
+			await this.poll(true);
+		}
+
+		private async toggleSync(): Promise<void> {
+			const t = target;
+			if (!t) return;
+			if (syncState) {
+				stopSyncWatcher();
+				this.tui.requestRender();
+				return;
+			}
+			try {
+				await startSync(t, {});
+			} catch (e) {
+				this.err = e instanceof Error ? e.message : String(e);
+			}
+			this.tui.requestRender();
+		}
+	}
+
+	async function openSshDashboard(ctx: any): Promise<void> {
+		if (typeof ctx?.ui?.custom !== "function") {
+			ctx.ui.notify(target ? statusLabel(target) : "SSH: not connected", "info");
+			return;
+		}
+		await ctx.ui.custom(
+			(tui: any, theme: any, _kb: any, done: (v: null) => void) => {
+				const dash = new SshDashboard(tui, theme, ctx, () => {
+					dash.stop();
+					done(null);
+				});
+				return {
+					render: (w: number) => dash.render(w),
+					invalidate: () => dash.invalidate(),
+					handleInput: (d: string) => {
+						dash.handleInput(d);
+						tui.requestRender();
+					},
+				};
+			},
+			{ overlay: true, overlayOptions: { width: "72%", minWidth: 56, maxHeight: "85%" } },
+		);
+	}
+
 	// --- runtime connect/disconnect/status ---
 	pi.registerCommand("ssh", {
 		description: "SSH remote: /ssh [-i key] user@host[:/path] [--activate <cmd>] [--env K=V] | /ssh @profile | /ssh cd <dir> | /ssh save <name> | /ssh profiles | /ssh off | /ssh",
@@ -1931,7 +2697,7 @@ print(json.dumps(out))
 			const arg = args.trim();
 
 			if (!arg) {
-				ctx.ui.notify(target ? statusLabel(target) : "SSH: not connected", "info");
+				await openSshDashboard(ctx);
 				return;
 			}
 

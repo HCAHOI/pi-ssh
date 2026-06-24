@@ -1,0 +1,40 @@
+{
+  "name": "pi-ssh",
+  "version": "0.1.0",
+  "description": "SSH remote execution for pi — edit locally, run remotely. Adds ssh_bash/read/write/edit/secret_write/grep/find/ls/process/push/pull/sync/tunnel tools and an interactive /ssh dashboard over a reused OpenSSH ControlMaster connection.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Chiyu Hao (https://github.com/HCAHOI)",
+  "homepage": "https://github.com/HCAHOI/pi-ssh",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HCAHOI/pi-ssh.git"
+  },
+  "bugs": {
+    "url": "https://github.com/HCAHOI/pi-ssh/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "ssh",
+    "remote",
+    "rsync",
+    "controlmaster"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ]
+}
