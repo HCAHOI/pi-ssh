@@ -202,6 +202,21 @@ note); `ssh_edit` shows a colored `+adds -dels` diff parsed from the remote patc
 The host tag and remote-relative paths come from the live connection at render
 time (best-effort; never throws if disconnected).
 
+## Reconnection
+
+Foreground file/read tools (`ssh_read`/`ls`/`find`/`grep`/`write`/`edit`/
+`secret_write`) auto-recover from transient transport drops: on a connection-level
+failure the dead ControlMaster is torn down and the command is retried with
+exponential backoff (1, 2, 4 … capped 30s) up to 10 attempts, showing a live
+status `Reconnecting user@host — attempt 2/10, retry in 1s…` and an info/error
+notice on recovery/give-up. It only re-runs on transport failures (where the
+command never executed), so re-running is safe.
+
+Gated by `AsyncLocalStorage` so background pollers (process/widget monitoring)
+never block on a long backoff — they keep failing fast and retrying next tick.
+`ssh_bash` and `ssh_process start` intentionally keep the single retry (re-running
+a long/launching command up to 10× would be unsafe).
+
 ## Design notes
 
 - OpenSSH ControlMaster multiplexing — one persistent master per connection.

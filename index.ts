@@ -40,6 +40,7 @@
  *   - bash on remote; python3 on remote for efficient in-place edit
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import { type FSWatcher, mkdirSync, readFileSync, watch, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -139,6 +140,10 @@ interface RunOptions {
 	 * Set false for internal, machine-parsed reads (status/log deltas) so a
 	 * remote profile banner cannot contaminate stdout or byte offsets. */
 	login?: boolean;
+	/** Opt in to exponential-backoff reconnection on transient transport failures.
+	 * Defaults to the ambient reconnectCtx store (set by withReconnect for
+	 * foreground tool calls); background pollers leave it off and retry once. */
+	reconnect?: boolean;
 }
 
 function runSsh(args: string[], opts?: RunOptions): Promise<RunResult> {
@@ -303,12 +308,80 @@ function isRetryableSshFailure(r: RunResult): boolean {
 	return /mux_client_request_session|Control socket connect|Connection reset|Connection closed|Broken pipe|Connection timed out|Connection refused|No route to host|kex_exchange_identification/i.test(message);
 }
 
+// --- exponential-backoff reconnection (opt-in; foreground tools only) ---
+// On a transient transport failure (isRetryableSshFailure), tear down the dead
+// ControlMaster and retry the command — the next ssh invocation auto-respawns the
+// master (ControlMaster=auto). With reconnect on, retry up to RECONNECT_MAX_ATTEMPTS
+// with exponential backoff and a visible status each attempt; otherwise keep the
+// historical retry-once. Only re-runs on transport failures (code 255 + known
+// patterns), where the command almost certainly never executed, so re-running is
+// safe. Background pollers must fail fast (retry next tick), so they never opt in.
+const RECONNECT_MAX_ATTEMPTS = 10;
+const RECONNECT_BASE_MS = 1000; // delay before the 2nd attempt
+const RECONNECT_FACTOR = 2; // doubles each attempt
+const RECONNECT_CAP_MS = 30_000; // cap on a single backoff delay
+
+const reconnectCtx = new AsyncLocalStorage<{ reconnect: boolean }>();
+
+interface ReconnectInfo {
+	remote: string;
+	attempt: number;
+	max: number;
+	delayMs: number;
+}
+type ReconnectPhase = "retrying" | "recovered" | "gaveup";
+let reconnectNotifier: ((phase: ReconnectPhase, info: ReconnectInfo) => void) | null = null;
+
+// Enable reconnection for every runRemoteCommand fn triggers. AsyncLocalStorage
+// scopes it to fn's async tree, so concurrent background pollers (which run
+// outside this context) never inherit it and never block on a long backoff.
+function withReconnect<T>(fn: () => Promise<T>): Promise<T> {
+	return reconnectCtx.run({ reconnect: true }, fn);
+}
+
+// Backoff (ms) before the given 1-indexed attempt number (>= 2): 1s,2s,4s,8s,16s,30s…
+function backoffDelay(attempt: number): number {
+	return Math.min(RECONNECT_CAP_MS, RECONNECT_BASE_MS * RECONNECT_FACTOR ** (attempt - 2));
+}
+
+// Resolves true if aborted during the wait, false if it slept the full duration.
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<boolean> {
+	return new Promise((resolve) => {
+		if (signal?.aborted) {
+			resolve(true);
+			return;
+		}
+		const onAbort = () => {
+			clearTimeout(timer);
+			resolve(true);
+		};
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve(false);
+		}, ms);
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
 async function runRemoteCommand(t: SshTarget, command: string, opts?: RunOptions): Promise<RunResult> {
 	const shell = remoteShell(command, opts?.login !== false);
+	const reconnect = opts?.reconnect ?? reconnectCtx.getStore()?.reconnect ?? false;
+	const maxAttempts = reconnect ? RECONNECT_MAX_ATTEMPTS : 2; // 2 => historical retry-once
 	let r = await runSsh([...sshConnArgs(t), shell], opts);
-	if (isRetryableSshFailure(r) && !opts?.signal?.aborted) {
+	let attempt = 1;
+	while (isRetryableSshFailure(r) && !opts?.signal?.aborted && attempt < maxAttempts) {
+		const next = attempt + 1;
 		await closeMaster(t);
+		if (reconnect) {
+			const delayMs = backoffDelay(next);
+			reconnectNotifier?.("retrying", { remote: t.remote, attempt: next, max: maxAttempts, delayMs });
+			if (await abortableSleep(delayMs, opts?.signal)) break;
+		}
 		r = await runSsh([...sshConnArgs(t), shell], opts);
+		attempt = next;
+	}
+	if (reconnect && attempt > 1) {
+		reconnectNotifier?.(isRetryableSshFailure(r) ? "gaveup" : "recovered", { remote: t.remote, attempt, max: maxAttempts, delayMs: 0 });
 	}
 	return r;
 }
@@ -699,7 +772,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Last seen ui handle, captured from any ctx, so the connection-level widget
 	// poller can update the footer widget without a live command/tool ctx.
-	let uiRef: { setStatus: (k: string, v?: string) => void; setWidget: (k: string, v?: unknown, o?: unknown) => void; theme: { fg: (c: string, s: string) => string } } | null = null;
+	let uiRef: { setStatus: (k: string, v?: string) => void; setWidget: (k: string, v?: unknown, o?: unknown) => void; notify: (msg: string, type?: "info" | "warning" | "error") => void; theme: { fg: (c: string, s: string) => string } } | null = null;
 	let widgetTimer: NodeJS.Timeout | null = null;
 	const WIDGET_POLL_MS = 5000;
 
@@ -742,6 +815,20 @@ export default function (pi: ExtensionAPI) {
 		if (target && uiRef) startWidgetPoller();
 		else stopWidgetPoller();
 	}
+
+	// Surface backoff-reconnection progress in the status line; notify on the outcome.
+	// Reads uiRef/target lazily at call time, so a single assignment stays current.
+	reconnectNotifier = (phase, info) => {
+		if (!uiRef) return;
+		if (phase === "retrying") {
+			uiRef.setStatus("ssh", uiRef.theme.fg("warning", `Reconnecting ${info.remote} \u2014 attempt ${info.attempt}/${info.max}, retry in ${Math.round(info.delayMs / 1000)}s\u2026`));
+			return;
+		}
+		const label = statusLabel(target);
+		uiRef.setStatus("ssh", label ? uiRef.theme.fg("accent", label) : "");
+		if (phase === "recovered") uiRef.notify(`SSH reconnected: ${info.remote}`, "info");
+		else uiRef.notify(`SSH reconnect to ${info.remote} failed after ${info.max} attempts`, "error");
+	};
 
 	function tokenizeSshArgs(input: string): string[] {
 		const tokens: string[] = [];
@@ -1405,7 +1492,7 @@ print(json.dumps(out))
 		async execute(id, params, signal, onUpdate, _ctx) {
 			const t = requireTarget();
 			const tool = createReadTool(localCwd, { operations: createRemoteReadOps(t, localCwd) });
-			return tool.execute(id, params, signal, onUpdate, _ctx);
+			return withReconnect(() => tool.execute(id, params, signal, onUpdate, _ctx));
 		},
 	});
 
@@ -1423,7 +1510,7 @@ print(json.dumps(out))
 		async execute(id, params, signal, onUpdate, _ctx) {
 			const t = requireTarget();
 			const tool = createLsTool(localCwd, { operations: createRemoteLsOps(t, localCwd) });
-			return tool.execute(id, params, signal, onUpdate, _ctx);
+			return withReconnect(() => tool.execute(id, params, signal, onUpdate, _ctx));
 		},
 	});
 
@@ -1443,7 +1530,7 @@ print(json.dumps(out))
 		async execute(id, params, signal, onUpdate, _ctx) {
 			const t = requireTarget();
 			const tool = createFindTool(localCwd, { operations: createRemoteFindOps(t, localCwd) });
-			return tool.execute(id, params, signal, onUpdate, _ctx);
+			return withReconnect(() => tool.execute(id, params, signal, onUpdate, _ctx));
 		},
 	});
 
@@ -1466,7 +1553,7 @@ print(json.dumps(out))
 			signal,
 		) {
 			const t = requireTarget();
-			const result = await runRemoteGrep(t, localCwd, params, signal);
+			const result = await withReconnect(() => runRemoteGrep(t, localCwd, params, signal));
 			return { content: [{ type: "text" as const, text: result.text }], details: result.details };
 		},
 	});
@@ -1485,7 +1572,7 @@ print(json.dumps(out))
 		async execute(id, params, signal, onUpdate, _ctx) {
 			const t = requireTarget();
 			const tool = createWriteTool(localCwd, { operations: createRemoteWriteOps(t, localCwd) });
-			return tool.execute(id, params, signal, onUpdate, _ctx);
+			return withReconnect(() => tool.execute(id, params, signal, onUpdate, _ctx));
 		},
 	});
 
@@ -1531,7 +1618,7 @@ print(json.dumps(out))
 			// umask 077 makes the create restrictive from the first byte; chmod sets the
 			// final mode. The secret arrives only on stdin, never in argv.
 			const cmd = `mkdir -p -- "$(dirname ${q})" && ( umask 077 && cat > ${q} ) && chmod ${mode} ${q}`;
-			const r = await withFileLock(`${t.remote}:${remotePath}`, () => runRemoteCommand(t, cmd, { stdin: value }));
+			const r = await withReconnect(() => withFileLock(`${t.remote}:${remotePath}`, () => runRemoteCommand(t, cmd, { stdin: value })));
 			if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
 			return { content: [{ type: "text" as const, text: `Wrote secret (${value.length} bytes) to ${t.remote}:${remotePath} (mode ${mode}). Value not recorded.` }] };
 		},
@@ -1559,7 +1646,7 @@ print(json.dumps(out))
 
 			if (t.hasPython) {
 				try {
-					const res = await remotePatchEdit(t, remotePath, params.edits, signal);
+					const res = await withReconnect(() => remotePatchEdit(t, remotePath, params.edits, signal));
 					return {
 						content: [
 							{
@@ -1580,7 +1667,7 @@ print(json.dumps(out))
 
 			// Fallback: read-rewrite-write via the edit tool's own diff engine.
 			const tool = createEditTool(localCwd, { operations: createRemoteEditOps(t, localCwd, false) });
-			return withFileLock(`${t.remote}:${remotePath}`, () => tool.execute(id, params, signal, onUpdate, _ctx));
+			return withReconnect(() => withFileLock(`${t.remote}:${remotePath}`, () => tool.execute(id, params, signal, onUpdate, _ctx)));
 		},
 	});
 
