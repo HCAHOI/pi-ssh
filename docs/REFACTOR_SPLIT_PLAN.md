@@ -1,9 +1,51 @@
 # Phase 0: Split & Reorganize `index.ts`
 
-> Status: design / not yet implemented
-> Scope: this repo (`pi-ssh`). Pure structural refactor — **zero behavior
-> change**. Prerequisite for the monitor decoupling (see `MONITOR_PLAN.md`).
-> Precedent to mirror: `@aliou/pi-processes` (multi-file pi extension).
+> Status: ✅ **DONE** (runtime-verified). Pure structural refactor — **zero
+> behavior change**. Prerequisite for the monitor decoupling (see
+> `MONITOR_PLAN.md`). Precedent mirrored: `@aliou/pi-processes`.
+
+---
+
+## ✅ Outcome (what actually shipped)
+
+`index.ts` went **2858 → 400 lines**; 21 focused modules. Done in 9 commits
+(`0a`→`0e`), each gated on the tsc baseline (19 pre-existing version-skew errors,
+never more) and `--noUnusedLocals`. Two independent fresh-context reviews: both
+"safe to build on," zero blockers/concerns. Smoke-tested live against a real
+remote after a pi restart (connect, bash, fs, edit, secret_write, process
+start/output/list/kill/clear, push/pull, tunnel, sync, **and the full poller
+lifecycle: 3 watch matches + success completion notification**).
+
+**Final module layout (`src/`):**
+
+| module | role |
+|---|---|
+| `index.ts` (400) | activation: builds `SshContext`, attaches managers, calls `setup*(ctx)` |
+| `context.ts` | `SshContext` interface (the shared surface) |
+| `types.ts` | shared interfaces (`SshTarget`, `Run*`, `Watch*`, `PollerState`, …) |
+| `utils.ts` | shQuote, paths, formatDuration, summarizeRsync, withFileLock, grepArgs, buildEnvExports |
+| `notify.ts` | `sendProcessMessage` — the agent notification sink |
+| `render.ts` | `createRender(getTarget, localCwd)` — renderCall/renderResult helpers |
+| `transfer.ts` | rsync core (runLocalProcess, runRsyncTransfer, …; take `localCwd`) |
+| `process-queries.ts` | processRoot, listProcesses, formatProcRows, build{Kill,Clear}Command, processRunScript |
+| `poller.ts` | `createPollerManager(pi)` — start/stop/has/repointAll/markLatestStart/rehydrate; `buildWatchStates`, `NotifyConfig` |
+| `remote-ops.ts` | create*Ops factories, runRemoteGrep, remotePatchEdit, PATCH_SCRIPT |
+| `tunnels.ts` | `createTunnelManager(ctx)` — stopAll/list + ssh_tunnel tool |
+| `sync.ts` | `createSyncManager(ctx)` — stop/startSync/getState + ssh_sync tool |
+| `hooks.ts` | `setupHooks(ctx)` — session_start/shutdown, before_agent_start |
+| `dashboard.ts` | `setupDashboard(ctx)` — SshDashboard TUI + /ssh command |
+| `ssh/{transport,reconnect,target}.ts` | runSsh/runRemoteCommand; backoff+notifier; resolveTarget |
+| `tools/{connection,fs,bash,process,transfer}.ts` | `setup*(ctx)` tool registrations |
+
+**Key seams for the monitor work:** `poller.ts` (the watch engine) → `notify.ts`
+(`sendProcessMessage`); a NotifyPolicy/throttle/digest layer slots between
+`runWatches` and `emit`. New subsystems register through the same
+`setup*(ctx: SshContext)` pattern. `fetchDeltaLines` (in `poller.ts`) and
+`runRemoteCommand` (in `ssh/transport.ts`) are the reusable signal-acquisition
+primitives.
+
+> The sections below are the original pre-implementation plan, kept for the
+> rationale/sub-phase record. They are now historical.
 
 ---
 

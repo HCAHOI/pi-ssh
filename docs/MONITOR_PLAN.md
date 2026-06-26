@@ -1,11 +1,18 @@
 # Plan: Decouple Monitoring from Processes in `pi-ssh`
 
-> Status: design / not yet implemented
-> Scope: this repo (`pi-ssh`, single-file `index.ts`). Remote-only.
+> Status: design / not yet implemented (Phase 0 split is **DONE** — see below).
+> Scope: this repo (`pi-ssh`). Remote-only.
 > North star: monitoring is a first-class, runtime-manageable capability that
 > binds to *any* remote signal source (process stream / log file / probe
 > command), under a configurable notify policy — not a frozen `ssh_process start`
 > parameter.
+
+> **Prerequisite done.** The codebase is now split into `src/` modules
+> (`REFACTOR_SPLIT_PLAN.md`, runtime-verified). The watch engine lives in
+> `src/poller.ts` (`createPollerManager(pi)`); the sink is `src/notify.ts`
+> (`sendProcessMessage`); subsystems register via `setup*(ctx: SshContext)`. The
+> "grounded in `index.ts`" references below now map to `src/poller.ts` +
+> `src/process-queries.ts` + `src/tools/process.ts` (see the mapping in §1).
 
 ---
 
@@ -26,18 +33,20 @@ agnostic helper so it stays testable and could be upstreamed later.
 
 ---
 
-## 1. What exists today (grounded in `index.ts`)
+## 1. What exists today (now in `src/poller.ts` + `src/tools/process.ts`)
 
 The monitoring pipeline already has three layers — they're just welded together
-and bound 1:1 to a process job.
+and bound 1:1 to a process job. After the Phase 0 split, all of this lives inside
+`createPollerManager(pi)` in `src/poller.ts` (engine) and the `ssh_process` tool
+in `src/tools/process.ts` (schema), with the sink in `src/notify.ts`.
 
-| Layer | Symbols (current) | Notes |
+| Layer | Symbols (file) | Notes |
 |-------|-------------------|-------|
-| **Source** | `fetchDeltaLines(p, stream)` | `tail -c +offset` of `<dir>/{stdout,stderr}.log`; advances byte offset to last `\n`. Only source = a managed process's two streams. |
-| **Match/Engine** | `PollerState.watches: WatchState[]`, `runWatches()`, `sweepWatches()`, `tick()` | Watches live **inside** the per-job poller. `tick` (one `setInterval` per job, 3s) does completion-detection **and** watch-sweeping together. Watch state = `fired: boolean`. |
-| **Sink** | `emit()` → `pi.sendMessage({customType:"ssh-process"}, {triggerTurn:true, deliverAs:"followUp"})` | Re-engages the agent. Used for both watch hits (`kind:"watch"`) and completion (`kind:"completion"`). |
-| **Config/persist** | `notify.json` per job dir, `notified` sentinel, `rehydratePollers()` | Watches set only at `start` (and re-set at `attach`). Persisted so pollers re-arm after reconnect/restart; offsets seek to EOF on rehydrate so history doesn't re-fire. |
-| **Schema** | `ssh_process` tool, `logWatches` param, `WatchSpec`, `buildWatchStates()` | `logWatches` is a parameter of `start`/`attach`. |
+| **Source** | `fetchDeltaLines(p, stream)` (`poller.ts`) | `tail -c +offset` of `<dir>/{stdout,stderr}.log`; advances byte offset to last `\n`. Only source = a managed process's two streams. |
+| **Match/Engine** | `PollerState.watches: WatchState[]`, `runWatches()`, `sweepWatches()`, `tick()` (`poller.ts`) | Watches live **inside** the per-job poller (`createPollerManager` closure). `tick` (one `setInterval` per job, 3s) does completion-detection **and** watch-sweeping together. Watch state = `fired: boolean`. |
+| **Sink** | `sendProcessMessage(pi, content, details)` (`notify.ts`) → `pi.sendMessage({customType:"ssh-process"}, {triggerTurn:true, deliverAs:"followUp"})` | Re-engages the agent. The poller's internal `emit` + the sync watcher both delegate to it. Used for watch hits (`kind:"watch"`) and completion (`kind:"completion"`). |
+| **Config/persist** | `notify.json` per job dir, `notified` sentinel, `poller.rehydrate()` (`poller.ts`) | Watches set only at `start` (and re-set at `attach`). Persisted so pollers re-arm after reconnect/restart; offsets seek to EOF on rehydrate so history doesn't re-fire. |
+| **Schema** | `ssh_process` tool (`tools/process.ts`), `logWatches` param, `WatchSpec`, `buildWatchStates()` (`poller.ts`) | `logWatches` is a parameter of `start`/`attach`. |
 
 ### The coupling, precisely
 
@@ -211,13 +220,11 @@ Priority by value/effort:
 
 ## 8. Migration phases (each independently shippable, back-compat)
 
-- **Phase 0 — Split & reorganize `index.ts` (prerequisite).** Break the
-  2858-line monolith into `src/` modules with an explicit `SshContext`, so the
-  watch engine, transport, tools, and UI have clean seams. Pure structural
-  refactor, **zero behavior change**. Full detail in `REFACTOR_SPLIT_PLAN.md`.
-  The monitor work below assumes the post-split layout (`poller.ts`,
-  `remote-ops.ts`, `tools/process.ts`, the `setup*(ctx)` seam).
-- **Phase 1 — `ssh_monitor` tool + standalone monitor store + rehydrate.**
+- **Phase 0 — Split & reorganize `index.ts` (prerequisite).** ✅ **DONE** &
+  runtime-verified. `index.ts` 2858 → 400; 21 modules; watch engine in
+  `poller.ts`, sink in `notify.ts`, `setup*(ctx)` seam. Detail +
+  outcome in `REFACTOR_SPLIT_PLAN.md`.
+- **Phase 1 — `ssh_monitor` tool + standalone monitor store + rehydrate.** ← NEXT.
   Process-source only. Mid-run create/update/pause/remove now possible.
 - **Phase 2 — Notify policy + captures (roadmap 1).** Spam fix ships.
 - **Phase 3 — `file:`/`probe:` sources + silence (roadmap 3,4).**
