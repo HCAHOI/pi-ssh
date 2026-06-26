@@ -40,17 +40,15 @@
  *   - bash on remote; python3 on remote for efficient in-place edit
  */
 
-import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import { type FSWatcher, mkdirSync, readFileSync, watch, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { Type } from "typebox";
 import type { AgentToolUpdateCallback, ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Container, Key, matchesKey, type SelectItem, SelectList, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Key, matchesKey, type SelectItem, SelectList, truncateToWidth } from "@earendil-works/pi-tui";
 import {
-	type BashOperations,
 	createBashTool,
 	createEditTool,
 	createFindTool,
@@ -59,18 +57,10 @@ import {
 	createReadTool,
 	createReadToolDefinition,
 	createWriteTool,
-	type EditOperations,
-	type FindOperations,
-	type LsOperations,
-	type ReadOperations,
-	type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
 
 import type {
 	Activation,
-	EditResult,
-	PollerState,
-	RunOptions,
 	RunResult,
 	SshTarget,
 	WatchSpec,
@@ -79,9 +69,7 @@ import type {
 import {
 	buildEnvExports,
 	formatDuration,
-	grepArgs,
 	shQuote,
-	stripTrailingSlash,
 	summarizeRsync,
 	toRemotePath,
 	withFileLock,
@@ -96,25 +84,15 @@ import {
 	remotePatchEdit,
 	runRemoteGrep,
 } from "./remote-ops";
-import {
-	type ReconnectInfo,
-	type ReconnectPhase,
-	setReconnectNotifier,
-	withReconnect,
-} from "./ssh/reconnect";
+import { setReconnectNotifier, withReconnect } from "./ssh/reconnect";
 import {
 	baseSshOptions,
 	closeMaster,
-	isRetryableSshFailure,
-	probePython,
-	remoteShell,
 	runRemoteCommand,
 	runSsh,
-	sshConnArgs,
-	sshExec,
 	sshFailureMessage,
 } from "./ssh/transport";
-import { resolveTarget, sshExecRaw } from "./ssh/target";
+import { resolveTarget } from "./ssh/target";
 import { sendProcessMessage } from "./notify";
 import { createRender } from "./render";
 import { buildWatchStates, createPollerManager, type NotifyConfig } from "./poller";
@@ -429,7 +407,7 @@ export default function (pi: ExtensionAPI) {
 
 	// Tool-call rendering helpers, bound to the active target getter.
 	const render = createRender(get, localCwd);
-	const { str, resultText, remoteDisplayPath, accentRemotePath, readLineRange, hostTag, sshTitle, renderEditDiffResult } = render;
+	const { str, remoteDisplayPath, accentRemotePath, readLineRange, sshTitle, renderEditDiffResult } = render;
 
 	// --- agent-callable connection management ---
 	pi.registerTool({
@@ -922,7 +900,7 @@ export default function (pi: ExtensionAPI) {
 				const name = params.name?.trim() || procId;
 				const script = processRunScript(t, { command: params.command, cwd: params.cwd, env: params.env, commandPrefix: params.commandPrefix }, localCwd);
 				// Persist the notification config so pollers can be re-armed after a
-				// reconnect / pi restart (rehydratePollers reads this).
+				// reconnect / pi restart (poller.rehydrate reads this).
 				const notifyJson = JSON.stringify({
 					name,
 					alertOnSuccess: params.alertOnSuccess ?? false,
