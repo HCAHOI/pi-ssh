@@ -31,6 +31,7 @@ export interface SshContext {
 	connectedText(t: SshTarget): string;
 	statusLabel(t: SshTarget | null): string;
 	profileNames(): string[];
+	profilesPath(): string;
 	saveProfile(name: string): void;
 	expandProfile(arg: string): string;
 	buildSshBashCommand(t: SshTarget, params: { command: string; cwd?: string; delaySeconds?: number; env?: Record<string, string>; commandPrefix?: string }): string;
