@@ -20,13 +20,15 @@ import { processRoot } from "./process-queries";
 // The source union. Phase 3 widens this; `process` stays first/unchanged.
 export type MonitorSource =
 	| { kind: "process"; procId: string; stream: "stdout" | "stderr" | "both" }
-	| { kind: "file"; path: string }; // absolute remote path
+	| { kind: "file"; path: string } // absolute remote path
+	| { kind: "probe"; command: string; intervalMs: number; consecutive?: number };
 
 // Per-source mutable runtime: offsets/clocks the driver advances each poll.
 // Replaces the bare process-only `dir`/`off` that lived on MonitorState.
 export type SourceRuntime =
 	| { kind: "process"; dir: string; off: Record<string, number> }
-	| { kind: "file"; off: number };
+	| { kind: "file"; off: number }
+	| { kind: "probe"; lastRunAt: number; hits: number };
 
 /** What one poll observed this tick. The engine turns this into matches/teardown. */
 export interface PollResult {
@@ -207,18 +209,72 @@ const FileSourceDriver: SourceDriver = {
 	},
 };
 
+// --- probe source ----------------------------------------------------------
+
+// Probe commands run via a non-login shell (like the other monitor internals):
+// deterministic, no profile banners. The command is the user's own (trusted like
+// ssh_bash); it is passed whole to runRemoteCommand, never interpolated.
+const PROBE_TIMEOUT_S = 20;
+
+const ProbeSourceDriver: SourceDriver = {
+	async validate(_t, source) {
+		if (source.kind !== "probe") return;
+		if (!source.command.trim()) throw new Error("probe source requires a non-empty command.");
+	},
+	async initRuntime() {
+		// Zero clocks: lastRunAt=0 makes the first tick run the probe immediately.
+		return { kind: "probe", lastRunAt: 0, hits: 0 };
+	},
+	async rehydrateRuntime() {
+		return { kind: "probe", lastRunAt: 0, hits: 0 };
+	},
+	async poll(t, source, srt, opts) {
+		if (source.kind !== "probe" || srt.kind !== "probe") return {};
+		// A latched one-shot stops sampling entirely (no command runs while latched).
+		if (!opts.readDeltas) return {};
+		// Cadence gate: the shared scheduler ticks every few seconds, but the probe runs
+		// only once per its own intervalMs (tick granularity rounds up to the tick).
+		const now = Date.now();
+		if (now - srt.lastRunAt < source.intervalMs) return {};
+		srt.lastRunAt = now;
+		const r = await runRemoteCommand(t, source.command, { login: false, timeout: PROBE_TIMEOUT_S });
+		return { probe: { stdout: r.stdout.toString().trim(), exitCode: r.code ?? -1 } };
+	},
+};
+
 export const DRIVERS: Record<MonitorSource["kind"], SourceDriver> = {
 	process: ProcessSourceDriver,
 	file: FileSourceDriver,
+	probe: ProbeSourceDriver,
 };
 
 export function sourceLabel(s: MonitorSource): string {
-	return s.kind === "process" ? `process:${s.procId}:${s.stream}` : `file:${s.path}`;
+	if (s.kind === "process") return `process:${s.procId}:${s.stream}`;
+	if (s.kind === "file") return `file:${s.path}`;
+	return `probe:${s.command}`;
 }
 
-/** Parse a `process:<procId>[:<stream>]` or `file:<absolute-path>` source string. */
-export function parseSource(raw: string): MonitorSource {
+/** Extra probe-only fields that arrive as separate tool params (not in the source string). */
+export interface ParseSourceOpts {
+	intervalMs?: number;
+	consecutive?: number;
+}
+
+/** Parse a `process:<procId>[:<stream>]`, `file:<absolute-path>`, or `probe:<command>` source. */
+export function parseSource(raw: string, opts?: ParseSourceOpts): MonitorSource {
 	const text = raw.trim();
+	if (text.startsWith("probe:")) {
+		// Everything after `probe:` is the command verbatim (may contain spaces/colons;
+		// do NOT split). intervalMs/consecutive arrive as separate tool params.
+		const command = text.slice("probe:".length).trim();
+		if (!command) throw new Error(`Invalid --source "${raw}": missing probe command.`);
+		const intervalMs = opts?.intervalMs;
+		if (intervalMs === undefined) throw new Error("probe source requires intervalMs (e.g. intervalMs=60000).");
+		if (!Number.isFinite(intervalMs) || intervalMs < 1000) throw new Error(`probe intervalMs must be a number >= 1000 ms, got ${intervalMs}.`);
+		const consecutive = opts?.consecutive;
+		if (consecutive !== undefined && (!Number.isInteger(consecutive) || consecutive < 1)) throw new Error(`probe consecutive must be a positive integer, got ${consecutive}.`);
+		return { kind: "probe", command, intervalMs, consecutive };
+	}
 	if (text.startsWith("file:")) {
 		// Everything after `file:` is the path verbatim (absolute remote path; may
 		// legitimately contain spaces/colons — do NOT split on ':').
@@ -228,7 +284,7 @@ export function parseSource(raw: string): MonitorSource {
 		return { kind: "file", path };
 	}
 	if (!text.startsWith("process:")) {
-		throw new Error(`Unsupported --source "${raw}". Use process:<procId>[:stdout|stderr|both] or file:<absolute-path>.`);
+		throw new Error(`Unsupported --source "${raw}". Use process:<procId>[:stdout|stderr|both], file:<absolute-path>, or probe:<command>.`);
 	}
 	const rest = text.slice("process:".length);
 	const lastColon = rest.lastIndexOf(":");
