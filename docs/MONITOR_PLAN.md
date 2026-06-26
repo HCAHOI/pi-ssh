@@ -239,8 +239,13 @@ Priority by value/effort:
   `NotifyGate` between `runMatch`'s `re.exec` and `emit`; `every-match | every-n |
   throttle | digest | milestone` + capture-aware template; `notifyWhen` deferred
   to Phase 3; ships the project's first unit tests).
-- **Phase 3 — `file:`/`probe:` sources + silence (roadmap 3,4).**
-- **Phase 4 — digest/ETA, routing (roadmap 5,6).**
+- **Phase 3 — `file:`/`probe:` sources + silence + `notifyWhen` (roadmap 3,4).**
+  ← NEXT. Self-contained implementation plan: **`MONITOR_PHASE3_PLAN.md`**
+  (per-kind `SourceDriver` refactor, pure no-`eval` `expr.ts`, one-shot silence;
+  `process:` behavior byte-unchanged). Note: digest/ETA (roadmap 5) already
+  shipped in Phase 2.
+- **Phase 4 — routing/composition (roadmap 6): severity channels, mute-progress-
+  on-error, sequence combinators.**
 
 `ssh_process start --logWatches` stays as sugar throughout, desugaring to a
 process-bound `MonitorSpec` with `{ mode:"every-match" }`.
