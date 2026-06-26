@@ -15,14 +15,15 @@ import { runRemoteCommand } from "./ssh/transport";
 import { processRoot } from "./process-queries";
 import { sendProcessMessage } from "./notify";
 import { makeNotifyGate, policyLabel, type GateDecision, type NotifyGate, type NotifyPolicy } from "./notify-policy";
+import { DRIVERS, processRuntime, sourceLabel, streamsOf, type MonitorSource, type SourceRuntime } from "./sources";
+
+// Re-export the source surface so existing importers (tools/monitor.ts) keep their
+// `from "../monitor"` paths; the types/helpers now live in sources.ts.
+export { fetchDelta, parseSource, sourceLabel, type MonitorSource } from "./sources";
 
 const EVERY_MATCH: NotifyPolicy = { mode: "every-match" };
 
 const POLL_INTERVAL_MS = 3000;
-
-// Phase 1: the only source kind is a managed process's stdout/stderr stream(s).
-// file:/probe: sources land in Phase 3 (MONITOR_PLAN §7.4), extending this union.
-export type MonitorSource = { kind: "process"; procId: string; stream: "stdout" | "stderr" | "both" };
 
 /** Persisted shape of a standalone monitor (<remoteCwd>/.pi-ssh-monitors/<id>.json). */
 export interface MonitorFile {
@@ -50,10 +51,8 @@ interface MonitorState {
 	repeat: boolean;
 	name?: string;
 	target: SshTarget;
-	/** Resolved process dir (<root>/<procId>) the source streams live under. */
-	dir: string;
-	/** Per-stream byte offset into the source log(s). */
-	off: Record<string, number>;
+	/** Per-source mutable runtime (offsets/clocks). Replaces the bare process dir/off. */
+	srt: SourceRuntime;
 	paused: boolean;
 	/** One-shot (repeat=false) latch: once matched it stops matching. Only applies
 	 * under the every-match policy; aggregating policies always keep matching. */
@@ -160,50 +159,6 @@ export function assertPolicyMatchesPattern(notify: NotifyPolicy, pattern: string
 	}
 }
 
-function streamsOf(stream: "stdout" | "stderr" | "both"): Array<"stdout" | "stderr"> {
-	return stream === "both" ? ["stdout", "stderr"] : [stream];
-}
-
-export function sourceLabel(s: MonitorSource): string {
-	return `process:${s.procId}:${s.stream}`;
-}
-
-/** Parse a `process:<procId>[:<stream>]` source string. Stream defaults to "both". */
-export function parseSource(raw: string): MonitorSource {
-	const text = raw.trim();
-	if (!text.startsWith("process:")) {
-		throw new Error(`Unsupported --source "${raw}". Phase 1 supports process:<procId>[:stdout|stderr|both].`);
-	}
-	const rest = text.slice("process:".length);
-	const lastColon = rest.lastIndexOf(":");
-	let procId = rest;
-	let stream: "stdout" | "stderr" | "both" = "both";
-	if (lastColon !== -1) {
-		const tail = rest.slice(lastColon + 1);
-		if (tail === "stdout" || tail === "stderr" || tail === "both") {
-			stream = tail;
-			procId = rest.slice(0, lastColon);
-		}
-	}
-	if (!procId.trim()) throw new Error(`Invalid --source "${raw}": missing process id.`);
-	return { kind: "process", procId: procId.trim(), stream };
-}
-
-// Read new complete lines appended to a remote file since `off`. Advances only to
-// the last newline so partial lines (and multibyte chars straddling the boundary)
-// are re-read intact next tick. Byte-offset based, so nothing logged during Mac
-// sleep is lost — it is swept on the first tick after wake. (Generalized from the
-// poller's fetchDeltaLines: takes an explicit file + offset, returns nextOff.)
-export async function fetchDelta(t: SshTarget, file: string, off: number): Promise<{ lines: string[]; nextOff: number }> {
-	const r = await runRemoteCommand(t, `tail -c +${off + 1} -- ${shQuote(file)} 2>/dev/null || true`, { timeout: 20, login: false });
-	if (r.code !== 0) return { lines: [], nextOff: off };
-	const buf = r.stdout;
-	if (buf.length === 0) return { lines: [], nextOff: off };
-	const lastNl = buf.lastIndexOf(0x0a);
-	if (lastNl === -1) return { lines: [], nextOff: off }; // no complete line yet
-	return { lines: buf.subarray(0, lastNl).toString("utf8").split("\n"), nextOff: off + lastNl + 1 };
-}
-
 export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 	const monitors = new Map<string, MonitorState>();
 	let timer: NodeJS.Timeout | null = null;
@@ -234,26 +189,6 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 		maybeStopTimer();
 	}
 
-	// Process status, used only to decide when to auto-tear-down a process-bound
-	// monitor. A transient SSH failure returns "running" so a flaky tick during a
-	// reconnect blip never spuriously removes a live monitor.
-	async function procStatus(t: SshTarget, dir: string): Promise<"running" | "done" | "gone"> {
-		const cmd = `d=${shQuote(dir)}; if [ ! -d "$d" ]; then echo gone; else pid=$(cat "$d/pid" 2>/dev/null || true); if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo running; else echo done; fi; fi`;
-		const r = await runRemoteCommand(t, cmd, { timeout: 20, login: false });
-		if (r.code !== 0) return "running";
-		const out = r.stdout.toString().trim().split("\n").pop() || "";
-		return out === "gone" ? "gone" : out === "done" ? "done" : "running";
-	}
-
-	async function eofOffsets(t: SshTarget, dir: string, stream: "stdout" | "stderr" | "both"): Promise<Record<string, number>> {
-		const off: Record<string, number> = {};
-		for (const s of streamsOf(stream)) {
-			const r = await runRemoteCommand(t, `wc -c < ${shQuote(`${dir}/${s}.log`)} 2>/dev/null || echo 0`, { timeout: 20, login: false });
-			off[s] = r.code === 0 ? Number.parseInt(r.stdout.toString().trim(), 10) || 0 : 0;
-		}
-		return off;
-	}
-
 	// Only the every-match policy honors the one-shot latch; aggregating policies
 	// (every-n/throttle/digest/milestone) must keep matching to do their job.
 	function isOneShot(m: MonitorState): boolean {
@@ -277,57 +212,51 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 		});
 	}
 
-	function runMatch(m: MonitorState, stream: "stdout" | "stderr", lines: string[]): void {
-		for (const line of lines) {
-			if (m.fired && isOneShot(m)) break;
-			// exec (not test) so named groups are captured for the notify policy/template.
-			// The regex is non-global (compilePattern adds no flags), so lastIndex never
-			// advances and each line is matched independently.
-			const match = m.re.exec(line);
-			if (!match) continue;
-			m.matchCount++;
-			m.lastMatchAt = Date.now();
-			m.captures = { ...(match.groups ?? {}) };
-			const decision = m.gate.onMatch({ line, captures: m.captures, matchCount: m.matchCount, now: m.lastMatchAt });
-			if (decision.fire) emitMonitor(m, decision, stream, line);
-			if (isOneShot(m)) {
-				m.fired = true;
-				break;
-			}
-		}
+	function runMatch(m: MonitorState, stream: "stdout" | "stderr" | undefined, line: string): void {
+		if (m.fired && isOneShot(m)) return;
+		// exec (not test) so named groups are captured for the notify policy/template.
+		// The regex is non-global (compilePattern adds no flags), so lastIndex never
+		// advances and each line is matched independently.
+		const match = m.re.exec(line);
+		if (!match) return;
+		m.matchCount++;
+		m.lastMatchAt = Date.now();
+		m.captures = { ...(match.groups ?? {}) };
+		const decision = m.gate.onMatch({ line, captures: m.captures, matchCount: m.matchCount, now: m.lastMatchAt });
+		if (decision.fire) emitMonitor(m, decision, stream, line);
+		if (isOneShot(m)) m.fired = true;
 	}
 
+	// Source-agnostic orchestration: the per-kind SourceDriver does the polling
+	// (liveness, offsets, sampling); this loop applies the regex + notify gate and
+	// handles teardown. Adding a source kind means adding a driver, not editing this.
 	async function sweepMonitor(m: MonitorState): Promise<void> {
 		if (m.paused || m.busy || m.finished) return;
 		m.busy = true;
 		try {
-			const status = await procStatus(m.target, m.dir);
-			if (status === "gone") {
-				// Source process cleared/removed: orphaned monitor, tear it down (and
-				// delete its persisted file for standalone monitors). Mirrors the poller
-				// gone→stop path (§9.3).
+			// A latched one-shot reads nothing (offsets frozen) but still probes liveness
+			// so it tears down when its source ends — same as the pre-refactor sweep.
+			const readDeltas = !(m.fired && isOneShot(m));
+			const result = await DRIVERS[m.source.kind].poll(m.target, m.source, m.srt, { readDeltas });
+			if (result.vanished) {
+				// Source gone for good (e.g. process dir cleared): orphaned monitor, tear it
+				// down (and delete its persisted file for standalone monitors), no final sweep.
 				await removeInternal(m);
 				return;
 			}
-			if (!(m.fired && isOneShot(m))) {
-				for (const s of streamsOf(m.source.stream)) {
-					const file = `${m.dir}/${s}.log`;
-					const { lines, nextOff } = await fetchDelta(m.target, file, m.off[s] ?? 0);
-					if (nextOff !== (m.off[s] ?? 0)) m.off[s] = nextOff;
-					if (lines.length) runMatch(m, s, lines);
-				}
+			if (readDeltas) {
+				for (const { stream, line } of result.matches ?? []) runMatch(m, stream, line);
 			}
 			const now = Date.now();
-			if (status === "done") {
-				// Process exited: the sweep above read every remaining byte, so no new
-				// lines can arrive. Flush any pending digest, then stop (the bound process
-				// is finished, the monitor is spent).
+			if (result.ended) {
+				// Source finished: the poll above read every remaining byte, so no new lines
+				// can arrive. Flush any pending digest, then stop (the monitor is spent).
 				const close = m.gate.onClose(now);
 				if (close.fire) emitMonitor(m, close);
 				m.finished = true;
 				await removeInternal(m);
 			} else {
-				// Still running: give time-based policies (digest) a chance to flush.
+				// Still live: give time-based policies (digest) a chance to flush.
 				const tick = m.gate.onTick(now);
 				if (tick.fire) emitMonitor(m, tick);
 			}
@@ -380,7 +309,7 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 		name?: string;
 		paused: boolean;
 		target: SshTarget;
-		off: Record<string, number>;
+		srt: SourceRuntime;
 		notify?: NotifyPolicy;
 		template?: string;
 	}): MonitorState {
@@ -394,8 +323,7 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 			repeat: args.repeat,
 			name: args.name,
 			target: args.target,
-			dir: `${processRoot(args.target)}/${args.source.procId}`,
-			off: args.off,
+			srt: args.srt,
 			paused: args.paused,
 			fired: false,
 			matchCount: 0,
@@ -412,15 +340,13 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 	async function create(t: SshTarget, opts: CreateMonitorOpts): Promise<MonitorState> {
 		compilePattern(opts.pattern); // fail fast before any remote round-trip
 		assertPolicyMatchesPattern(opts.notify ?? EVERY_MATCH, opts.pattern);
-		const dir = `${processRoot(t)}/${opts.source.procId}`;
-		const status = await procStatus(t, dir);
-		if (status === "gone") throw new Error(`Process ${opts.source.procId} not found (no ${dir}). Start it with ssh_process or check the id with ssh_process list.`);
-		if (status === "done") throw new Error(`Process ${opts.source.procId} has already exited; a monitor only matches NEW log lines, so there is nothing to watch. Inspect past output with ssh_process output instead.`);
+		const driver = DRIVERS[opts.source.kind];
+		await driver.validate(t, opts.source);
 		const id = `mon_${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
-		// Seek to current EOF so a monitor attached to an already-running process does
+		// Seek to current EOF so a monitor attached to an already-running source does
 		// not re-fire on historical log lines (same rule as poller rehydrate).
-		const off = await eofOffsets(t, dir, opts.source.stream);
-		const state = buildState({ id, kind: "standalone", source: opts.source, pattern: opts.pattern, repeat: opts.repeat ?? false, name: opts.name, paused: false, target: t, off, notify: opts.notify, template: opts.template });
+		const srt = await driver.initRuntime(t, opts.source);
+		const state = buildState({ id, kind: "standalone", source: opts.source, pattern: opts.pattern, repeat: opts.repeat ?? false, name: opts.name, paused: false, target: t, srt, notify: opts.notify, template: opts.template });
 		addMonitor(state);
 		await persist(state);
 		return state;
@@ -437,7 +363,8 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 			while (monitors.has(id)) id = `mon_${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`; // guard the loop's only un-deduped id source
 			const off: Record<string, number> = {};
 			for (const s of streamsOf(stream)) off[s] = offsets ? offsets[s] : 0;
-			const state = buildState({ id, kind: "standalone", source: { kind: "process", procId, stream }, pattern: w.pattern, repeat: w.repeat ?? false, name, paused: false, target: t, off, notify: w.notify, template: w.template });
+			const srt = processRuntime(`${processRoot(t)}/${procId}`, off);
+			const state = buildState({ id, kind: "standalone", source: { kind: "process", procId, stream }, pattern: w.pattern, repeat: w.repeat ?? false, name, paused: false, target: t, srt, notify: w.notify, template: w.template });
 			addMonitor(state);
 			// Best-effort: the in-memory monitor is armed regardless; a failed file write
 			// only costs cross-restart persistence, it must not fail the already-started job.
@@ -456,7 +383,8 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 			const stream = w.stream ?? "both";
 			const off: Record<string, number> = {};
 			for (const s of streamsOf(stream)) off[s] = opts?.offsets ? opts.offsets[s] : 0;
-			const state = buildState({ id, kind: "legacy", source: { kind: "process", procId, stream }, pattern: w.pattern, repeat: w.repeat ?? false, name: opts?.name, paused: false, target: t, off });
+			const srt = processRuntime(`${processRoot(t)}/${procId}`, off);
+			const state = buildState({ id, kind: "legacy", source: { kind: "process", procId, stream }, pattern: w.pattern, repeat: w.repeat ?? false, name: opts?.name, paused: false, target: t, srt });
 			addMonitor(state);
 		});
 	}
@@ -597,11 +525,6 @@ print(json.dumps({'monitors': mons, 'procs': procs}))
 		} catch {
 			return;
 		}
-		const eofFor = (proc: { outSize: number; errSize: number }, stream: "stdout" | "stderr" | "both"): Record<string, number> => {
-			const off: Record<string, number> = {};
-			for (const s of streamsOf(stream)) off[s] = s === "stdout" ? proc.outSize : proc.errSize;
-			return off;
-		};
 		// Standalone monitors from their persisted files.
 		for (const b64 of parsed.monitors) {
 			let spec: MonitorFile;
@@ -618,7 +541,9 @@ print(json.dumps({'monitors': mons, 'procs': procs}))
 				continue;
 			}
 			try {
-				const state = buildState({ id: spec.id, kind: "standalone", source: spec.source, pattern: spec.pattern, repeat: !!spec.repeat, name: spec.name, paused: !!spec.paused, target: t, off: eofFor(proc, spec.source.stream), notify: spec.notify, template: spec.template });
+				// Seed offsets from the scan's known sizes (no extra wc -c round-trip).
+				const srt = await DRIVERS[spec.source.kind].rehydrateRuntime(t, spec.source, { outSize: proc.outSize, errSize: proc.errSize });
+				const state = buildState({ id: spec.id, kind: "standalone", source: spec.source, pattern: spec.pattern, repeat: !!spec.repeat, name: spec.name, paused: !!spec.paused, target: t, srt, notify: spec.notify, template: spec.template });
 				addMonitor(state);
 			} catch {
 				// A corrupt/invalid persisted monitor (e.g. bad regex) must not abort
@@ -644,7 +569,10 @@ print(json.dumps({'monitors': mons, 'procs': procs}))
 				if (monitors.has(id)) return;
 				const stream = w.stream ?? "both";
 				try {
-					const state = buildState({ id, kind: "legacy", source: { kind: "process", procId, stream }, pattern: w.pattern, repeat: w.repeat ?? false, name: procName, paused: false, target: t, off: eofFor(proc, stream) });
+					const off: Record<string, number> = {};
+					for (const s of streamsOf(stream)) off[s] = s === "stdout" ? proc.outSize : proc.errSize;
+					const srt = processRuntime(`${proot}/${procId}`, off);
+					const state = buildState({ id, kind: "legacy", source: { kind: "process", procId, stream }, pattern: w.pattern, repeat: w.repeat ?? false, name: procName, paused: false, target: t, srt });
 					addMonitor(state);
 				} catch {
 					// Skip an unusable watch (e.g. bad regex from a hand-edited notify.json)
@@ -668,7 +596,8 @@ print(json.dumps({'monitors': mons, 'procs': procs}))
 		repointAll: (t) => {
 			for (const m of monitors.values()) {
 				m.target = t;
-				m.dir = `${processRoot(t)}/${m.source.procId}`;
+				// Re-resolve any process-relative paths against the new connection's cwd.
+				if (m.source.kind === "process" && m.srt.kind === "process") m.srt.dir = `${processRoot(t)}/${m.source.procId}`;
 			}
 		},
 		stopAll: () => {
