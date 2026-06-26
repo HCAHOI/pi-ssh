@@ -1,0 +1,254 @@
+# Plan: Decouple Monitoring from Processes in `pi-ssh`
+
+> Status: design / not yet implemented
+> Scope: this repo (`pi-ssh`, single-file `index.ts`). Remote-only.
+> North star: monitoring is a first-class, runtime-manageable capability that
+> binds to *any* remote signal source (process stream / log file / probe
+> command), under a configurable notify policy — not a frozen `ssh_process start`
+> parameter.
+
+---
+
+## 0. Decision: build natively, do NOT depend on `@aliou/pi-processes`
+
+`@aliou/pi-processes` acquires signal from local Node `ChildProcess` streams
+(`child.stdout.on("data")`). `pi-ssh` acquires signal by polling remote log
+files (`tail -c +offset` over SSH, every `POLL_INTERVAL_MS`). **The
+signal-acquisition layer — where all the work is — has zero overlap.** The only
+transport-agnostic piece is the notify-policy state machine, which pi-processes
+does not even export (it's inlined in `matchWatches`).
+
+`pi-ssh` today has **zero runtime dependencies** (only peer deps on the pi
+framework). Taking a hard dep on a local-only package to reuse ~200 lines of pure
+logic is a bad trade. → **Implement monitoring natively**, reusing this repo's
+own primitives. Keep the notify-policy logic in a self-contained, transport-
+agnostic helper so it stays testable and could be upstreamed later.
+
+---
+
+## 1. What exists today (grounded in `index.ts`)
+
+The monitoring pipeline already has three layers — they're just welded together
+and bound 1:1 to a process job.
+
+| Layer | Symbols (current) | Notes |
+|-------|-------------------|-------|
+| **Source** | `fetchDeltaLines(p, stream)` | `tail -c +offset` of `<dir>/{stdout,stderr}.log`; advances byte offset to last `\n`. Only source = a managed process's two streams. |
+| **Match/Engine** | `PollerState.watches: WatchState[]`, `runWatches()`, `sweepWatches()`, `tick()` | Watches live **inside** the per-job poller. `tick` (one `setInterval` per job, 3s) does completion-detection **and** watch-sweeping together. Watch state = `fired: boolean`. |
+| **Sink** | `emit()` → `pi.sendMessage({customType:"ssh-process"}, {triggerTurn:true, deliverAs:"followUp"})` | Re-engages the agent. Used for both watch hits (`kind:"watch"`) and completion (`kind:"completion"`). |
+| **Config/persist** | `notify.json` per job dir, `notified` sentinel, `rehydratePollers()` | Watches set only at `start` (and re-set at `attach`). Persisted so pollers re-arm after reconnect/restart; offsets seek to EOF on rehydrate so history doesn't re-fire. |
+| **Schema** | `ssh_process` tool, `logWatches` param, `WatchSpec`, `buildWatchStates()` | `logWatches` is a parameter of `start`/`attach`. |
+
+### The coupling, precisely
+
+1. `PollerState.watches` — watches are a field of the poller, which is 1:1 with a
+   process. No standalone monitor object, no N:M.
+2. Watches are settable only at `start`/`attach`. No mid-run add/change/remove.
+3. `tick()` fuses process-completion and log-watching into one loop.
+4. The only source is `process:<id>`'s stdout/stderr. No file/probe/resource.
+5. Stateless per-line match → one `emit` per hit → 50 `[N/50] DONE` = 50
+   notifications. `WatchState` has nowhere to keep aggregation state and no
+   notify policy.
+
+---
+
+## 2. Target design: Source / Monitor / Sink
+
+```
+Source (remote signal producer) ──┐
+                                  ├─< Binding N:M >── Monitor ── Sink
+Source ───────────────────────────┘                 (rule +     (emit →
+                                                      state +     sendMessage)
+                                                      policy)
+```
+
+- **Source** — addressed by id:
+  - `process:<id>:stdout|stderr|both` → existing `fetchDeltaLines`
+  - `file:<remotePath>` → same tail-by-offset logic on an arbitrary remote file
+  - `probe:<cmd>` → run a remote command every interval, read stdout/exit code
+- **Monitor** — standalone object, own id (`mon_…`), own lifecycle and **state**
+  (captures, matchCount, lastFireAt, digest buffer, silence timer). Holds the
+  rule + notify policy. Lives in a `Map<string, MonitorState>`, **not** inside
+  `PollerState`.
+- **Sink** — keep `emit()` as the single sink initially (agent notification);
+  leave room for severity/channel later.
+- **Binding** — a monitor lists one or more sources. N:M.
+
+Process **completion** alerts (`alertOnSuccess/Failure/Kill`) stay where they are
+— that's process-lifecycle, not log-monitoring. Only **watches** get decoupled.
+(Conceptually completion is "a built-in monitor on a `status` source"; we don't
+need to refactor it to get the win, and keeping it put de-risks migration.)
+
+---
+
+## 3. New types (in `index.ts`, near current `WatchSpec`/`WatchState`)
+
+```ts
+// Source binding for a monitor (remote).
+type MonitorSource =
+  | { kind: "process"; procId: string; stream: "stdout" | "stderr" | "both" }
+  | { kind: "file"; path: string }
+  | { kind: "probe"; command: string; intervalMs: number };
+
+// Transport-agnostic notify policy (own helper module — see §5).
+type NotifyPolicy =
+  | { mode: "every-match" }                      // == today's behavior
+  | { mode: "every-n"; n: number }
+  | { mode: "throttle"; minIntervalMs: number }
+  | { mode: "digest"; everyMs: number }
+  | { mode: "milestone"; fractions: number[] };  // uses captured n/total
+
+interface MonitorSpec {                          // persisted (JSON)
+  id: string;
+  sources: MonitorSource[];
+  pattern: string;                               // regex; may have named groups
+  notifyWhen?: string;                           // optional expr over captures
+  expectEveryMs?: number;                        // silence/stall detection
+  notify: NotifyPolicy;                          // default { mode:"every-match" }
+  template?: string;                             // text; may reference captures
+}
+
+interface MonitorState extends MonitorSpec {
+  re: RegExp;
+  off: Record<string, number>;                   // per-source byte offset (sourceId -> off)
+  // runtime aggregation state (the thing WatchState has nowhere to put):
+  fired: boolean;
+  matchCount: number;
+  lastFireAt: number | null;
+  lastMatchAt: number | null;
+  captures: Record<string, string>;
+  digestBuffer: string[];
+  timer: NodeJS.Timeout | null;
+  busy: boolean;
+}
+```
+
+`WatchState`/`WatchSpec` are kept for the legacy `ssh_process logWatches` sugar,
+which desugars into a `MonitorSpec` bound to `process:<id>` (§6).
+
+---
+
+## 4. New tool: `ssh_monitor` (sibling to `ssh_process`)
+
+A dedicated tool is cleaner than overloading `ssh_process`, and mirrors the
+existing `ssh_process attach` ergonomics.
+
+```
+ssh_monitor create  --source process:<id>:stderr --pattern '\[(?<n>\d+)/(?<total>\d+)\] DONE' \
+                    --notify digest:5m --template 'progress {n}/{total}'   → mon_1
+ssh_monitor create  --source file:/var/log/train.log --pattern 'Traceback' --notify throttle:60s
+ssh_monitor create  --source 'probe:nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits' \
+                    --intervalMs 60000 --notifyWhen 'value==0' --consecutive 3
+ssh_monitor list
+ssh_monitor update  mon_1 --notify milestone:0.25,0.5,0.75,1.0
+ssh_monitor pause   mon_1
+ssh_monitor resume  mon_1
+ssh_monitor remove  mon_1
+```
+
+Actions: `create | list | update | pause | resume | remove | attach` (TypeBox
+union, matching the `ssh_process` action pattern).
+
+---
+
+## 5. Engine changes (reuse, don't duplicate)
+
+1. **Generalize `fetchDeltaLines`** to take `(file, off)` instead of `(poller,
+   stream)`, returning `{ lines, nextOff }`. The process-stream path and the new
+   `file:` source both call it. (Currently it's hard-bound to
+   `p.dir/<stream>.log` and mutates `p.off`.)
+2. **Monitor scheduler** — one shared `setInterval` (or per-monitor timer, like
+   pollers) that for each live monitor: sweeps each source's delta lines, runs
+   the rule, updates `MonitorState`, then applies the notify policy before
+   `emit()`. Reuse the `busy`/`finished` guard and swallow-errors-per-tick
+   discipline from `tick()`.
+3. **`probe:` sources** reuse `runRemoteCommand(target, command, {login:false})`
+   on `intervalMs`; predicate over `{ stdout, exitCode }`.
+4. **Silence detection** — in the same sweep, if `expectEveryMs` set and
+   `now - lastMatchAt > expectEveryMs`, fire once.
+5. **NotifyPolicy + captures = a pure, transport-agnostic helper** (e.g. a
+   `makeNotifyGate(policy)` returning `(event) => { fire: bool, text? }`). No SSH,
+   no I/O — unit-testable, upstreamable.
+6. **Sink unchanged** — keep `emit()`. Monitor events carry `kind:"monitor"`,
+   `monitorId`, `captures` in `details`.
+
+What we explicitly reuse from current code: `fetchDeltaLines` (generalized),
+`runRemoteCommand`, `emit`/`pi.sendMessage`, the EOF-seek-on-rehydrate trick, the
+`notified`/idempotency pattern, the per-tick error-swallow + `busy` guard.
+
+---
+
+## 6. Persistence & rehydrate
+
+- Process-bound monitors created via `ssh_process logWatches` sugar keep living
+  in the job's `notify.json` (back-compat; desugared to a `MonitorSpec` at load).
+- Standalone monitors get a target-level store: `<processRoot>/../.pi-ssh-monitors/<mon_id>.json`
+  (parallel to `.pi-ssh-processes/`), since they can bind to non-process sources.
+- Extend `rehydratePollers()` (or add `rehydrateMonitors()`) to re-arm monitors
+  on (re)connect, seeking each source offset to EOF so history doesn't re-fire —
+  exactly the existing poller rule. Reuse the python-scan approach already used
+  for jobs.
+
+---
+
+## 7. Capability roadmap (each maps to a field, never a new `start` flag)
+
+Priority by value/effort:
+
+1. **Notify policy (throttle/every-n/digest/milestone) + captures** — kills the
+   50-notification spam. Pure helper (§5.5). *Do first.*
+2. **Runtime lifecycle** (`ssh_monitor create/update/pause/remove` on a running
+   job) — add/change watches with zero restart. The core decoupling win.
+3. **Silence/stall detection** (`expectEveryMs`) — catches hangs that never exit,
+   which completion alerts can't see. One timer.
+4. **`file:` and `probe:` sources** — monitor arbitrary logs / GPU / `ps` / ports
+   / checkpoints, including things `ssh_process` didn't start.
+5. **Digest + ETA** — rolling `23/50 done · 1.4/min · ETA ~19m` from captures.
+6. **Routing/composition** — severity channels, mute-progress-on-error, sequence
+   combinators. Deferred.
+
+---
+
+## 8. Migration phases (each independently shippable, back-compat)
+
+- **Phase 0 — Split & reorganize `index.ts` (prerequisite).** Break the
+  2858-line monolith into `src/` modules with an explicit `SshContext`, so the
+  watch engine, transport, tools, and UI have clean seams. Pure structural
+  refactor, **zero behavior change**. Full detail in `REFACTOR_SPLIT_PLAN.md`.
+  The monitor work below assumes the post-split layout (`poller.ts`,
+  `remote-ops.ts`, `tools/process.ts`, the `setup*(ctx)` seam).
+- **Phase 1 — `ssh_monitor` tool + standalone monitor store + rehydrate.**
+  Process-source only. Mid-run create/update/pause/remove now possible.
+- **Phase 2 — Notify policy + captures (roadmap 1).** Spam fix ships.
+- **Phase 3 — `file:`/`probe:` sources + silence (roadmap 3,4).**
+- **Phase 4 — digest/ETA, routing (roadmap 5,6).**
+
+`ssh_process start --logWatches` stays as sugar throughout, desugaring to a
+process-bound `MonitorSpec` with `{ mode:"every-match" }`.
+
+---
+
+## 9. Open questions (resolve before Phase 2)
+
+1. **Expression evaluator** for `notifyWhen`/`probeWhen`: tiny safe parser over a
+   fixed variable set (captures + `value`/`exitCode` + `matchCount` + `elapsedMs`).
+   No `eval`.
+2. **One shared monitor timer vs per-monitor `setInterval`** — pollers are
+   per-job today; a single monitor scheduler is cheaper at scale. Pick one.
+3. **Monitor ↔ process lifecycle**: when the bound process is cleared/gone,
+   auto-remove its process-source monitors? (Yes — mirror the `gone` → stopPoller
+   path.)
+4. **Group sources**: binding one monitor to several processes (the "50 subtasks
+   as one job" digest case) — explicit id list vs name glob.
+5. **`ssh_monitor` vs extending `ssh_process`**: separate tool (recommended) vs a
+   new `monitor`-ish action set on `ssh_process`.
+
+---
+
+## 10. One-line summary
+
+Lift watches out of `PollerState`/`notify.json` into a first-class, runtime-
+manageable **Monitor** that binds (N:M) to pluggable remote **Sources**
+(process / file / probe) and fires through the existing `emit` **Sink** under a
+configurable **NotifyPolicy** — built natively in `pi-ssh`, reusing
+`fetchDeltaLines` / `runRemoteCommand` / `emit`, no external dependency.
