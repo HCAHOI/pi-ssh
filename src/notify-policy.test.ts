@@ -191,6 +191,16 @@ test("gate vars: explicit fields override same-named captures", () => {
 	assert.equal(d.text, "REAL|9"); // ev.line / ev.matchCount win over captures
 });
 
+test("digest: ETA rate is cumulative-over-total-elapsed, correct across windows", () => {
+	const g = makeNotifyGate({ mode: "digest", everyMs: 1000 });
+	g.onMatch(ev({ matchCount: 10, captures: { n: "10", total: "100" }, now: 1000 })); // firstAt=1000
+	assert.match(g.onTick(2000).text ?? "", /ETA 9s/); // 10 done in 1s → 90 left → 9s
+	g.onMatch(ev({ matchCount: 20, captures: { n: "20", total: "100" }, now: 3000 }));
+	// 2nd window: 20 done over 3s elapsed (from first match) → 80 left at 20/3000 → 12s.
+	// (Buggy firstAt-reset would compute ~4s.)
+	assert.match(g.onTick(4000).text ?? "", /ETA 12s/);
+});
+
 test("digest: ETA/progress when total is captured", () => {
 	const g = makeNotifyGate({ mode: "digest", everyMs: 1000 });
 	g.onMatch(ev({ matchCount: 10, captures: { n: "10", total: "100" }, now: 0 }));

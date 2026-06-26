@@ -228,8 +228,8 @@ export function makeNotifyGate(policy: NotifyPolicy, opts?: { template?: string 
 		case "digest": {
 			const everyMs = policy.everyMs;
 			let count = 0;
-			let firstAt: number | null = null; // first match of the current batch's window origin
-			let lastFlushAt: number | null = null;
+			let firstAt: number | null = null; // first match EVER (rate anchor for ETA; never reset)
+			let lastFlushAt: number | null = null; // window-cadence clock (reset each flush)
 			let lastLine = "";
 			let lastCaptures: Record<string, string> = {};
 			let lastMatchCount = 0;
@@ -245,9 +245,10 @@ export function makeNotifyGate(policy: NotifyPolicy, opts?: { template?: string 
 				if (p.total !== undefined) vars.total = p.total;
 				if (p.eta) vars.eta = p.eta;
 				count = 0;
-				firstAt = null;
-				// Reset the window origin so the NEXT batch's window starts at its first
-				// match (not from this flush), avoiding an early flush after a quiet gap.
+				// Reset only the window-cadence clock so the NEXT batch's window starts at
+				// its first match (avoids an early flush after a quiet gap). firstAt stays
+				// at the first match ever, so the ETA rate = cumulative done / total
+				// elapsed stays correct across windows.
 				lastFlushAt = null;
 				return { fire: true, text: render(def, vars), details: { count: c } };
 			};
