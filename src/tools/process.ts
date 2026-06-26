@@ -180,37 +180,45 @@ export function setupProcessTool(ssh: SshContext): void {
 				if (notifyB64) {
 					try { saved = JSON.parse(Buffer.from(notifyB64, "base64").toString()); } catch { /* ignore corrupt config */ }
 				}
-				const cfg: Required<NotifyConfig> = {
-					name: params.name?.trim() || saved.name || params.id,
+				const name = params.name?.trim() || saved.name || params.id;
+				const offsets = { stdout: Number.parseInt(outStr, 10) || 0, stderr: Number.parseInt(errStr, 10) || 0 };
+				// Explicit logWatches at attach are first-class (== ssh_monitor create),
+				// seeking EOF since the job is already running. Validate before persisting.
+				const userWatches: ProcessWatch[] = (params.logWatches ?? []).map((w) => {
+					compilePattern(w.pattern);
+					const notify = parseNotifyPolicy(w.notify);
+					assertPolicyMatchesPattern(notify, w.pattern);
+					return { pattern: w.pattern, stream: w.stream, repeat: w.repeat, notify, template: w.template };
+				});
+				// saved.watches only exist for pre-upgrade jobs; keep them in notify.json and
+				// re-arm via the legacy shim. New jobs have none → no `watches` key is
+				// written (preserving the first-class invariant).
+				const legacyWatches = saved.watches ?? [];
+				validateWatchPatterns(legacyWatches);
+				const persistCfg: NotifyConfig = {
+					name,
 					alertOnSuccess: params.alertOnSuccess ?? saved.alertOnSuccess ?? true,
 					alertOnFailure: params.alertOnFailure ?? saved.alertOnFailure ?? true,
 					alertOnKill: params.alertOnKill ?? saved.alertOnKill ?? false,
-					watches: params.logWatches ?? saved.watches ?? [],
+					...(legacyWatches.length ? { watches: legacyWatches } : {}),
 				};
-				// Fail fast on a bad regex BEFORE persisting cfg to notify.json, so an
-				// invalid pattern can never poison the job's persisted config (which would
-				// then trip every future rehydrate).
-				validateWatchPatterns(cfg.watches);
 				// Persist merged prefs and clear the notified marker so a finished job
 				// re-fires its completion exactly once for this explicit attach.
-				const persist = `d=${shQuote(dir)}; printf %s ${shQuote(JSON.stringify(cfg))} > "$d/notify.json"; rm -f "$d/notified"`;
+				const persist = `d=${shQuote(dir)}; printf %s ${shQuote(JSON.stringify(persistCfg))} > "$d/notify.json"; rm -f "$d/notified"`;
 				await runRemoteCommand(t, persist, { signal, login: false }).catch(() => {});
 				poller.startPoller({
 					procId: params.id,
-					name: cfg.name,
+					name,
 					dir,
 					target: t,
-					alertOnSuccess: cfg.alertOnSuccess,
-					alertOnFailure: cfg.alertOnFailure,
-					alertOnKill: cfg.alertOnKill,
+					alertOnSuccess: persistCfg.alertOnSuccess ?? true,
+					alertOnFailure: persistCfg.alertOnFailure ?? true,
+					alertOnKill: persistCfg.alertOnKill ?? false,
 				});
-				// Re-arm the job's watches via the legacy in-memory shim (attach is a
-				// re-arm path; the first-class way to add a monitor to a running job is
-				// ssh_monitor create). Seek to current EOF so history is not re-matched.
-				if (cfg.watches.length) {
-					monitors.armLegacyWatches(t, params.id, cfg.watches, { offsets: { stdout: Number.parseInt(outStr, 10) || 0, stderr: Number.parseInt(errStr, 10) || 0 }, name: cfg.name });
-				}
-				return { content: [{ type: "text" as const, text: `Watching ${params.id} (${cfg.name}). Will notify on completion${cfg.watches.length ? " and matching log lines" : ""}.` }] };
+				if (legacyWatches.length) monitors.armLegacyWatches(t, params.id, legacyWatches, { offsets, name });
+				if (userWatches.length) await monitors.createForProcess(t, params.id, userWatches, name, offsets);
+				const watching = legacyWatches.length + userWatches.length;
+				return { content: [{ type: "text" as const, text: `Watching ${params.id} (${name}). Will notify on completion${watching ? " and matching log lines" : ""}.` }] };
 			}
 
 			if (params.action === "output") {

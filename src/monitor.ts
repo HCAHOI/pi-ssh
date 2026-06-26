@@ -114,8 +114,9 @@ export interface MonitorManager {
 	/** Create a standalone monitor; seeks the source to EOF so history does not re-fire. */
 	create(t: SshTarget, opts: CreateMonitorOpts): Promise<MonitorState>;
 	/** Create first-class, persisted monitors for an ssh_process job's logWatches
-	 * (the standard path: each logWatch == an ssh_monitor create). */
-	createForProcess(t: SshTarget, procId: string, watches: ProcessWatch[], name?: string): Promise<void>;
+	 * (the standard path: each logWatch == an ssh_monitor create). offsets default to
+	 * 0 (fresh job at start); pass current EOF when attaching a running job. */
+	createForProcess(t: SshTarget, procId: string, watches: ProcessWatch[], name?: string, offsets?: { stdout: number; stderr: number }): Promise<void>;
 	/** Back-compat shim: rebuild in-memory every-match monitors from an OLD job's
 	 * notify.json watches (deterministic ids, not persisted). Only legacy jobs hit this. */
 	armLegacyWatches(t: SshTarget, procId: string, watches: WatchSpec[], opts?: { offsets?: { stdout: number; stderr: number }; name?: string }): void;
@@ -429,12 +430,13 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 	// persisted standalone monitor bound to the just-started job. The logs are fresh
 	// (empty) so offsets start at 0 (== EOF), and the process is necessarily running,
 	// so we skip the status/EOF probes create() does.
-	async function createForProcess(t: SshTarget, procId: string, watches: ProcessWatch[], name?: string): Promise<void> {
+	async function createForProcess(t: SshTarget, procId: string, watches: ProcessWatch[], name?: string, offsets?: { stdout: number; stderr: number }): Promise<void> {
 		for (const w of watches) {
 			const stream = w.stream ?? "both";
-			const id = `mon_${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
+			let id = `mon_${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
+			while (monitors.has(id)) id = `mon_${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`; // guard the loop's only un-deduped id source
 			const off: Record<string, number> = {};
-			for (const s of streamsOf(stream)) off[s] = 0;
+			for (const s of streamsOf(stream)) off[s] = offsets ? offsets[s] : 0;
 			const state = buildState({ id, kind: "standalone", source: { kind: "process", procId, stream }, pattern: w.pattern, repeat: w.repeat ?? false, name, paused: false, target: t, off, notify: w.notify, template: w.template });
 			addMonitor(state);
 			// Best-effort: the in-memory monitor is armed regardless; a failed file write
