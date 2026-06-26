@@ -664,9 +664,13 @@ print(json.dumps({'monitors': mons, 'procs': procs}))
 `;
 		let parsed: { monitors: string[]; procs: Record<string, { running: boolean; outSize: number; errSize: number; notify: string }> };
 		try {
-			const r = await runRemoteCommand(t, `python3 -c ${shQuote(script)} ${shQuote(mroot)} ${shQuote(proot)}`, { timeout: 20, login: false });
+			// hasPython is probed in a login shell; use the same environment here so
+			// python3 is found on hosts where non-login PATH is minimal. Parse the last
+			// non-empty stdout line so profile banners don't break JSON parsing.
+			const r = await runRemoteCommand(t, `python3 -c ${shQuote(script)} ${shQuote(mroot)} ${shQuote(proot)}`, { timeout: 20 });
 			if (r.code !== 0) return;
-			parsed = JSON.parse(r.stdout.toString() || '{"monitors":[],"procs":{}}');
+			const jsonLine = r.stdout.toString().trim().split("\n").filter(Boolean).pop() || '{"monitors":[],"procs":{}}';
+			parsed = JSON.parse(jsonLine);
 		} catch {
 			return;
 		}

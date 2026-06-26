@@ -198,9 +198,13 @@ print(json.dumps(out))
 `;
 		let entries: Array<{ id: string; notify: string; running: boolean; notified: boolean }>;
 		try {
-			const r = await runRemoteCommand(t, `python3 -c ${shQuote(script)} ${shQuote(root)}`, { timeout: 20, login: false });
+			// hasPython is probed in a login shell; use the same environment here so
+			// python3 is found on hosts where non-login PATH is minimal. Parse the last
+			// non-empty stdout line so profile banners don't break JSON parsing.
+			const r = await runRemoteCommand(t, `python3 -c ${shQuote(script)} ${shQuote(root)}`, { timeout: 20 });
 			if (r.code !== 0) return;
-			entries = JSON.parse(r.stdout.toString() || "[]");
+			const jsonLine = r.stdout.toString().trim().split("\n").filter(Boolean).pop() || "[]";
+			entries = JSON.parse(jsonLine);
 		} catch {
 			return;
 		}
