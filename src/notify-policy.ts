@@ -88,6 +88,30 @@ export function parseNotifyPolicy(spec: string | undefined): NotifyPolicy {
 	}
 }
 
+/** Format ms back into the compact, re-parseable grammar (`90s` / `5m` / `1h` / `500ms`). */
+export function durationLabel(ms: number): string {
+	if (ms % 3_600_000 === 0) return `${ms / 3_600_000}h`;
+	if (ms % 60_000 === 0) return `${ms / 60_000}m`;
+	if (ms % 1_000 === 0) return `${ms / 1_000}s`;
+	return `${ms}ms`;
+}
+
+/** Render a policy back into its canonical `notify=` grammar (round-trips parseNotifyPolicy). */
+export function policyLabel(p: NotifyPolicy): string {
+	switch (p.mode) {
+		case "every-match":
+			return "every-match";
+		case "every-n":
+			return `every-n:${p.n}`;
+		case "throttle":
+			return `throttle:${durationLabel(p.minIntervalMs)}`;
+		case "digest":
+			return `digest:${durationLabel(p.everyMs)}`;
+		case "milestone":
+			return `milestone:${p.fractions.join(",")}`;
+	}
+}
+
 /** Substitute `{name}` tokens from vars; unknown tokens are left literal. */
 export function renderTemplate(tpl: string, vars: Record<string, string | number>): string {
 	return tpl.replace(/\{(\w+)\}/g, (whole, key: string) => (key in vars ? String(vars[key]) : whole));
@@ -138,13 +162,29 @@ export function makeNotifyGate(policy: NotifyPolicy, opts?: { template?: string 
 
 		case "every-n": {
 			const n = policy.n;
+			let lastLine = "";
+			let lastCaptures: Record<string, string> = {};
+			let lastMatchCount = 0;
+			let firedCount = 0; // matchCount at the last fire
 			return {
 				onMatch: (ev) => {
+					lastLine = ev.line;
+					lastCaptures = ev.captures;
+					lastMatchCount = ev.matchCount;
 					if (ev.matchCount % n !== 0) return NO_FIRE;
+					firedCount = ev.matchCount;
 					return { fire: true, text: render(`[${ev.matchCount} matches] ${ev.line}`, baseVars(ev, { count: n })), details: { batchedCount: n } };
 				},
 				onTick: () => NO_FIRE,
-				onClose: () => NO_FIRE,
+				// Flush the partial final batch so the tail (e.g. 67 matches under
+				// every-n:50 → the last 17) is not silently dropped when the job ends.
+				onClose: () => {
+					const rem = lastMatchCount - firedCount;
+					if (rem <= 0) return NO_FIRE;
+					firedCount = lastMatchCount;
+					const def = `[${rem} more match${rem === 1 ? "" : "es"}, ${lastMatchCount} total] ${lastLine}`;
+					return { fire: true, text: render(def, { ...lastCaptures, line: lastLine, matchCount: lastMatchCount, count: rem }), details: { batchedCount: rem, final: true } };
+				},
 			};
 		}
 
@@ -152,8 +192,22 @@ export function makeNotifyGate(policy: NotifyPolicy, opts?: { template?: string 
 			const ms = policy.minIntervalMs;
 			let lastFireAt = Number.NEGATIVE_INFINITY;
 			let suppressed = 0;
+			let lastLine = "";
+			let lastCaptures: Record<string, string> = {};
+			let lastMatchCount = 0;
+			const fireTail = (now: number): GateDecision => {
+				if (suppressed <= 0) return NO_FIRE;
+				const sup = suppressed;
+				suppressed = 0;
+				lastFireAt = now;
+				const def = `${lastLine} (+${sup} more since last)`;
+				return { fire: true, text: render(def, { ...lastCaptures, line: lastLine, matchCount: lastMatchCount, suppressed: sup, count: sup }), details: { suppressed: sup } };
+			};
 			return {
 				onMatch: (ev) => {
+					lastLine = ev.line;
+					lastCaptures = ev.captures;
+					lastMatchCount = ev.matchCount;
 					if (ev.now - lastFireAt < ms) {
 						suppressed++;
 						return NO_FIRE;
@@ -164,8 +218,10 @@ export function makeNotifyGate(policy: NotifyPolicy, opts?: { template?: string 
 					const def = sup > 0 ? `${ev.line} (+${sup} more since last)` : ev.line;
 					return { fire: true, text: render(def, baseVars(ev, { suppressed: sup, count: sup + 1 })), details: { suppressed: sup } };
 				},
-				onTick: () => NO_FIRE,
-				onClose: () => NO_FIRE,
+				// Surface a suppressed backlog once the interval has elapsed even if no
+				// new match arrives (a burst then silence would otherwise hide the tail).
+				onTick: (now) => (now - lastFireAt >= ms ? fireTail(now) : NO_FIRE),
+				onClose: (now) => fireTail(now),
 			};
 		}
 
@@ -189,7 +245,10 @@ export function makeNotifyGate(policy: NotifyPolicy, opts?: { template?: string 
 				if (p.total !== undefined) vars.total = p.total;
 				if (p.eta) vars.eta = p.eta;
 				count = 0;
-				lastFlushAt = now;
+				firstAt = null;
+				// Reset the window origin so the NEXT batch's window starts at its first
+				// match (not from this flush), avoiding an early flush after a quiet gap.
+				lastFlushAt = null;
 				return { fire: true, text: render(def, vars), details: { count: c } };
 			};
 			return {

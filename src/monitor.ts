@@ -14,25 +14,9 @@ import { shQuote } from "./utils";
 import { runRemoteCommand } from "./ssh/transport";
 import { processRoot } from "./process-queries";
 import { sendProcessMessage } from "./notify";
-import { formatDuration } from "./utils";
-import { makeNotifyGate, type GateDecision, type NotifyGate, type NotifyPolicy } from "./notify-policy";
+import { makeNotifyGate, policyLabel, type GateDecision, type NotifyGate, type NotifyPolicy } from "./notify-policy";
 
 const EVERY_MATCH: NotifyPolicy = { mode: "every-match" };
-
-function policyLabel(p: NotifyPolicy): string {
-	switch (p.mode) {
-		case "every-match":
-			return "every";
-		case "every-n":
-			return `every-${p.n}`;
-		case "throttle":
-			return `throttle:${formatDuration(p.minIntervalMs)}`;
-		case "digest":
-			return `digest:${formatDuration(p.everyMs)}`;
-		case "milestone":
-			return `milestone:${p.fractions.join(",")}`;
-	}
-}
 
 const POLL_INTERVAL_MS = 3000;
 
@@ -254,7 +238,7 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 
 	// Deliver a gate decision through the sink. `stream` is known for per-line
 	// matches but not for tick/close flushes (a digest can span both streams).
-	function emitMonitor(m: MonitorState, d: GateDecision, stream?: "stdout" | "stderr"): void {
+	function emitMonitor(m: MonitorState, d: GateDecision, stream?: "stdout" | "stderr", line?: string): void {
 		const label = m.name ? `"${m.name}" (${m.id})` : m.id;
 		const where = stream ? ` on ${stream}` : "";
 		emit(`🔔 ssh_monitor ${label} /${m.pattern}/${where} (process ${m.source.procId}):\n${d.text ?? ""}`, {
@@ -262,6 +246,7 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 			monitorId: m.id,
 			procId: m.source.procId,
 			...(stream ? { stream } : {}),
+			...(line !== undefined ? { line } : {}),
 			pattern: m.pattern,
 			matchCount: m.matchCount,
 			...d.details,
@@ -280,7 +265,7 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 			m.lastMatchAt = Date.now();
 			m.captures = { ...(match.groups ?? {}) };
 			const decision = m.gate.onMatch({ line, captures: m.captures, matchCount: m.matchCount, now: m.lastMatchAt });
-			if (decision.fire) emitMonitor(m, decision, stream);
+			if (decision.fire) emitMonitor(m, decision, stream, line);
 			if (isOneShot(m)) {
 				m.fired = true;
 				break;
@@ -478,7 +463,11 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 		if (patch.repeat !== undefined) m.repeat = patch.repeat;
 		if (patch.name !== undefined) m.name = patch.name;
 		// Rebuild the gate when policy or template changes (resets policy counters).
+		// Flush any pending buffer (digest window / throttle backlog) through the OLD
+		// gate first so a mid-window edit does not silently drop buffered matches.
 		if (patch.notify !== undefined || patch.template !== undefined) {
+			const flushed = m.gate.onClose(Date.now());
+			if (flushed.fire) emitMonitor(m, flushed);
 			m.notify = nextNotify;
 			m.template = nextTemplate;
 			m.gate = makeNotifyGate(nextNotify, { template: nextTemplate });

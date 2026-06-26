@@ -5,7 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { makeNotifyGate, parseDuration, parseNotifyPolicy, renderTemplate, type MatchEvent } from "./notify-policy";
+import { makeNotifyGate, parseDuration, parseNotifyPolicy, policyLabel, renderTemplate, type MatchEvent } from "./notify-policy";
 
 const ev = (over: Partial<MatchEvent> & { matchCount: number; now: number }): MatchEvent => ({
 	line: over.line ?? `line ${over.matchCount}`,
@@ -27,6 +27,17 @@ test("parseDuration: rejects junk and non-positive", () => {
 	assert.throws(() => parseDuration("soon"));
 	assert.throws(() => parseDuration("0s"));
 	assert.throws(() => parseDuration("-5m"));
+});
+
+test("parseDuration: decimals", () => {
+	assert.equal(parseDuration("1.5s"), 1500);
+	assert.equal(parseDuration("0.5m"), 30_000);
+});
+
+test("policyLabel round-trips through parseNotifyPolicy", () => {
+	for (const s of ["every-match", "every-n:50", "throttle:90s", "digest:5m", "milestone:0.25,0.5,1"]) {
+		assert.equal(policyLabel(parseNotifyPolicy(s)), s);
+	}
 });
 
 // --- parseNotifyPolicy -----------------------------------------------------
@@ -82,6 +93,21 @@ test("every-n: fires only on multiples of n", () => {
 	assert.deepEqual(fires, [false, false, true, false, false, true, false]);
 });
 
+// --- every-n remainder -----------------------------------------------------
+test("every-n: flushes the partial final batch on close, then is idempotent", () => {
+	const g = makeNotifyGate({ mode: "every-n", n: 50 });
+	for (let i = 1; i <= 67; i++) {
+		const d = g.onMatch(ev({ matchCount: i, now: i }));
+		assert.equal(d.fire, i === 50);
+	}
+	const close = g.onClose(100);
+	assert.equal(close.fire, true);
+	assert.equal(close.details?.batchedCount, 17);
+	assert.match(close.text ?? "", /17 more/);
+	assert.match(close.text ?? "", /67 total/);
+	assert.equal(g.onClose(101).fire, false); // nothing left to flush
+});
+
 // --- throttle --------------------------------------------------------------
 test("throttle: first fires, within-window suppressed, reports backlog on resume", () => {
 	const g = makeNotifyGate({ mode: "throttle", minIntervalMs: 1000 });
@@ -94,6 +120,28 @@ test("throttle: first fires, within-window suppressed, reports backlog on resume
 	assert.equal(d4.fire, true);
 	assert.equal(d4.details?.suppressed, 2);
 	assert.match(d4.text ?? "", /\+2 more since last/);
+});
+
+test("throttle: suppressed tail surfaces on tick after interval, then drains", () => {
+	const g = makeNotifyGate({ mode: "throttle", minIntervalMs: 1000 });
+	assert.equal(g.onMatch(ev({ matchCount: 1, now: 0 })).fire, true);
+	for (let i = 2; i <= 5; i++) assert.equal(g.onMatch(ev({ matchCount: i, now: 100 * i })).fire, false);
+	assert.equal(g.onTick(900).fire, false); // interval not elapsed
+	const t = g.onTick(1500);
+	assert.equal(t.fire, true);
+	assert.equal(t.details?.suppressed, 4);
+	assert.equal(g.onTick(3000).fire, false); // drained
+	assert.equal(g.onClose(4000).fire, false);
+});
+
+test("throttle: backlog flushes on close when the job ends muted", () => {
+	const g = makeNotifyGate({ mode: "throttle", minIntervalMs: 10_000 });
+	g.onMatch(ev({ matchCount: 1, now: 0 })); // fires
+	g.onMatch(ev({ matchCount: 2, now: 100 })); // suppressed
+	g.onMatch(ev({ matchCount: 3, now: 200 })); // suppressed
+	const c = g.onClose(300);
+	assert.equal(c.fire, true);
+	assert.equal(c.details?.suppressed, 2);
 });
 
 // --- digest ----------------------------------------------------------------
@@ -115,6 +163,32 @@ test("digest: buffers, flushes on tick after window, resets, flushes remainder o
 	assert.equal(close.fire, true);
 	assert.equal(close.details?.count, 1);
 	assert.match(close.text ?? "", /latest: c/);
+});
+
+test("digest: window restarts at the next batch's first match (no early flush after a gap)", () => {
+	const g = makeNotifyGate({ mode: "digest", everyMs: 10_000 });
+	g.onMatch(ev({ matchCount: 1, now: 0 }));
+	assert.equal(g.onTick(10_000).fire, true); // flush batch 1, window origin reset
+	// long quiet gap, then a single new match; the next tick is only 1s into the
+	// NEW batch, so it must NOT flush (would have, if origin stayed at last flush).
+	g.onMatch(ev({ matchCount: 2, now: 30_000 }));
+	assert.equal(g.onTick(31_000).fire, false);
+	assert.equal(g.onTick(40_000).fire, true); // 10s into the new batch → flush
+});
+
+test("digest: progress derives from matchCount when no n capture", () => {
+	const g = makeNotifyGate({ mode: "digest", everyMs: 1000 });
+	g.onMatch(ev({ matchCount: 25, captures: { total: "100" }, now: 0 }));
+	g.onMatch(ev({ matchCount: 50, captures: { total: "100" }, now: 2000 }));
+	const d = g.onTick(2000);
+	assert.equal(d.fire, true);
+	assert.match(d.text ?? "", /50%/); // 50/100 via matchCount
+});
+
+test("gate vars: explicit fields override same-named captures", () => {
+	const g = makeNotifyGate({ mode: "every-match" }, { template: "{line}|{matchCount}" });
+	const d = g.onMatch(ev({ matchCount: 9, line: "REAL", captures: { line: "CAP", matchCount: "x" }, now: 1 }));
+	assert.equal(d.text, "REAL|9"); // ev.line / ev.matchCount win over captures
 });
 
 test("digest: ETA/progress when total is captured", () => {

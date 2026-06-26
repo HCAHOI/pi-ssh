@@ -27,7 +27,8 @@
    `notify.json` logWatches keep working unchanged.
 4. **`digest` flushes on the shared tick**, not a per-monitor timer (we already
    have one shared `setInterval`; adding N timers contradicts §9.2). Flush
-   granularity = `POLL_INTERVAL_MS` (3s); `everyMs` is rounded up to that.
+   granularity = `POLL_INTERVAL_MS` (3s): an `everyMs` smaller than the tick is
+   effectively tick-gated (flushes each tick), not sub-tick.
 
 ---
 
@@ -113,13 +114,13 @@ export interface MonitorFile {
 All state lives **inside the gate closure** (counters, `lastFireAt`, digest
 buffer, fired-milestone set). Pure functions of injected `now`.
 
-| mode | `onMatch` fires when | `onTick`/`onClose` | notes |
+| mode | `onMatch` fires when | `onTick` / `onClose` | notes |
 |---|---|---|---|
-| `every-match` | always | no-op | identical to Phase 1 |
-| `every-n: n` | `matchCount % n === 0` | no-op | text notes the n-batch + latest line |
-| `throttle: ms` | `now - lastFireAt >= ms` (else buffer count) | no-op | on a firing match, report `suppressedCount` accumulated while muted |
-| `digest: ms` | never (buffers line + captures) | `onTick`: if `now - lastFlush >= ms` and buffer non-empty → fire summary; `onClose`: flush remainder | summary = count + first/last + (if `total` captured) progress/ETA |
-| `milestone: f[]` | progress crosses an unfired fraction | `onClose`: optionally fire 1.0 | progress = `n/total` from captures if present, else `matchCount/total`; requires a `total` capture (validated at create) |
+| `every-match` | always | no-op / no-op | identical to Phase 1 |
+| `every-n: n` | `matchCount % n === 0` | no-op / **flush partial final batch** | close reports the tail (e.g. 67 under every-n:50 → `17 more, 67 total`) so it is not silently dropped |
+| `throttle: ms` | `now - lastFireAt >= ms` (else buffer count) | **flush suppressed tail once `ms` elapsed** / **flush tail** | a firing match reports `suppressedCount`; tick/close surface a backlog that would otherwise hide after burst-then-silence |
+| `digest: ms` | never (buffers line + captures) | flush if `now - lastFlush >= ms` & non-empty (window restarts at the next batch's first match) / flush remainder | summary = count + (if `total` captured) progress/ETA + latest line |
+| `milestone: f[]` | progress crosses an unfired fraction | no-op / no-op | crossing-only — completion is `ssh_process`'s job, so no synthetic 1.0 on close; progress = `n/total` if `n` captured else `matchCount/total`; **requires a `total` capture** (validated at create) |
 
 **`repeat` interaction:** a non-`every-match` policy implies continuous matching,
 so the gate-driven monitor ignores the one-shot `fired` latch when
