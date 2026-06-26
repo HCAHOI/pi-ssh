@@ -137,6 +137,17 @@ function progressVars(
 	return { pct, eta, total, done };
 }
 
+// Documented optional template tokens, always resolved so a valid {eta}/{pct}/
+// {total} never leaks literally when progress isn't computable (no `total`
+// capture, or done==total at completion). Only genuine typos stay literal.
+function progressTemplateVars(p: { pct?: number; eta?: string; total?: number; done: number }): Record<string, string | number> {
+	return {
+		total: p.total ?? "?",
+		pct: p.pct ?? "?",
+		eta: p.eta ?? (p.total !== undefined && p.done >= p.total ? "0s" : "?"),
+	};
+}
+
 /**
  * Build a stateful notify gate for one monitor. All policy state (counters,
  * lastFireAt, digest buffer, fired-milestone set) lives in this closure; nothing
@@ -240,10 +251,7 @@ export function makeNotifyGate(policy: NotifyPolicy, opts?: { template?: string 
 				const progressLabel = p.pct !== undefined ? ` · ${p.pct}%` : "";
 				const etaLabel = p.eta ? ` · ETA ${p.eta}` : "";
 				const def = `${c} match${c === 1 ? "" : "es"}${progressLabel}${etaLabel}\nlatest: ${lastLine}`;
-				const vars: Record<string, string | number> = { ...lastCaptures, count: c, matchCount: lastMatchCount, line: lastLine };
-				if (p.pct !== undefined) vars.pct = p.pct;
-				if (p.total !== undefined) vars.total = p.total;
-				if (p.eta) vars.eta = p.eta;
+				const vars: Record<string, string | number> = { ...lastCaptures, count: c, matchCount: lastMatchCount, line: lastLine, ...progressTemplateVars(p) };
 				count = 0;
 				// Reset only the window-cadence clock so the NEXT batch's window starts at
 				// its first match (avoids an early flush after a quiet gap). firstAt stays
@@ -287,8 +295,7 @@ export function makeNotifyGate(policy: NotifyPolicy, opts?: { template?: string 
 					if (hit === null) return NO_FIRE;
 					const etaLabel = p.eta ? ` · ETA ${p.eta}` : "";
 					const def = `reached ${Math.round(hit * 100)}% (${p.done}/${p.total})${etaLabel}`;
-					const vars: Record<string, string | number> = { ...ev.captures, matchCount: ev.matchCount, line: ev.line, pct: p.pct ?? 0, total: p.total };
-					if (p.eta) vars.eta = p.eta;
+					const vars: Record<string, string | number> = { ...ev.captures, matchCount: ev.matchCount, line: ev.line, ...progressTemplateVars(p) };
 					return { fire: true, text: render(def, vars), details: { milestone: hit, pct: p.pct } };
 				},
 				onTick: () => NO_FIRE,

@@ -176,6 +176,34 @@ test("digest: window restarts at the next batch's first match (no early flush af
 	assert.equal(g.onTick(40_000).fire, true); // 10s into the new batch → flush
 });
 
+test("digest: template {eta} never leaks literally (completion + no-total)", () => {
+	// at completion (done==total) ETA is 0s, not the literal {eta}
+	const g = makeNotifyGate({ mode: "digest", everyMs: 1000 }, { template: "{n}/{total} ETA {eta}" });
+	g.onMatch(ev({ matchCount: 48, captures: { n: "48", total: "48" }, now: 1000 }));
+	const d = g.onClose(2000);
+	assert.equal(d.fire, true);
+	assert.doesNotMatch(d.text ?? "", /\{eta\}/);
+	assert.match(d.text ?? "", /48\/48 ETA 0s/);
+	// no total capture at all → {eta}/{total} resolve to ? not literal braces
+	const g2 = makeNotifyGate({ mode: "digest", everyMs: 1000 }, { template: "{total} ETA {eta}" });
+	g2.onMatch(ev({ matchCount: 3, captures: {}, now: 0 }));
+	const d2 = g2.onClose(1000);
+	assert.doesNotMatch(d2.text ?? "", /\{(eta|total)\}/);
+});
+
+test("milestone: template {eta} resolves at 100% (no literal leak)", () => {
+	const g = makeNotifyGate({ mode: "milestone", fractions: [1.0] }, { template: "{pct}% ETA {eta}" });
+	const d = g.onMatch(ev({ matchCount: 50, captures: { n: "50", total: "50" }, now: 500 }));
+	assert.equal(d.fire, true);
+	assert.doesNotMatch(d.text ?? "", /\{eta\}/);
+	assert.match(d.text ?? "", /100% ETA 0s/);
+});
+
+test("renderTemplate still leaves a genuine typo token literal", () => {
+	const g = makeNotifyGate({ mode: "every-match" }, { template: "{line} {notavar}" });
+	assert.match(g.onMatch(ev({ matchCount: 1, line: "x", now: 0 })).text ?? "", /x \{notavar\}/);
+});
+
 test("digest: progress derives from matchCount when no n capture", () => {
 	const g = makeNotifyGate({ mode: "digest", everyMs: 1000 });
 	g.onMatch(ev({ matchCount: 25, captures: { total: "100" }, now: 0 }));
