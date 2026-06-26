@@ -1,3 +1,6 @@
 node_modules/
 *.log
 .DS_Store
+
+# local typecheck baseline (env-specific: tied to installed pi .d.ts version)
+docs/.tsc-baseline.txt
