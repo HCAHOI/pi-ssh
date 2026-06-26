@@ -8,6 +8,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { SshTarget } from "./types";
 import type { PollerManager } from "./poller";
+import type { MonitorManager } from "./monitor";
 import type { SshRender } from "./render";
 import type { TunnelManager } from "./tunnels";
 import type { SyncManager } from "./sync";
@@ -20,6 +21,8 @@ export interface SshContext {
 	/** Active target or throw a connect-first error. */
 	requireTarget(): SshTarget;
 	poller: PollerManager;
+	/** Runtime-managed log monitors (decoupled from ssh_process; see src/monitor.ts). */
+	monitors: MonitorManager;
 	/** Agent-facing notification sink (completion / watch / sync alerts). */
 	emit(content: string, details: Record<string, unknown>): void;
 	render: SshRender;

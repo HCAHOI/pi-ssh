@@ -4,12 +4,13 @@
 
 import { randomBytes } from "node:crypto";
 import { Type } from "typebox";
-import type { WatchSpec, WatchState } from "../types";
+import type { WatchSpec } from "../types";
 import type { SshContext } from "../context";
 import { shQuote } from "../utils";
 import { runRemoteCommand, sshFailureMessage } from "../ssh/transport";
 import { createRemoteBashOps } from "../remote-ops";
-import { buildWatchStates, type NotifyConfig } from "../poller";
+import type { NotifyConfig } from "../poller";
+import { validateWatchPatterns } from "../monitor";
 import {
 	buildClearCommand,
 	buildKillCommand,
@@ -20,7 +21,7 @@ import {
 } from "../process-queries";
 
 export function setupProcessTool(ssh: SshContext): void {
-	const { pi, localCwd, requireTarget, poller, render } = ssh;
+	const { pi, localCwd, requireTarget, poller, monitors, render } = ssh;
 	const { str, sshTitle } = render;
 
 	pi.registerTool({
@@ -85,6 +86,7 @@ export function setupProcessTool(ssh: SshContext): void {
 			const root = processRoot(t);
 			if (params.action === "start") {
 				if (!params.command?.trim()) throw new Error("ssh_process start requires command");
+				validateWatchPatterns(params.logWatches); // fail fast on a bad regex before launching
 				const procId = `${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
 				const dir = `${root}/${procId}`;
 				const name = params.name?.trim() || procId;
@@ -113,7 +115,6 @@ export function setupProcessTool(ssh: SshContext): void {
 				].join(" && ");
 				const r = await runRemoteCommand(t, cmd, { stdin: script, signal });
 				if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
-				const watches: WatchState[] = buildWatchStates(params.logWatches);
 				// Record this as the most recent run of `name` so an older run's late
 				// completion alert can be flagged as superseded.
 				poller.markLatestStart(name, procId);
@@ -125,13 +126,17 @@ export function setupProcessTool(ssh: SshContext): void {
 					alertOnSuccess: params.alertOnSuccess ?? false,
 					alertOnFailure: params.alertOnFailure ?? true,
 					alertOnKill: params.alertOnKill ?? false,
-					watches,
 					startedAt: Date.now(),
 				});
+				// logWatches is sugar for process-bound monitors: arm them from the fresh
+				// (empty) logs so they sweep from the top, exactly as before. The watch
+				// specs persist in notify.json and rehydrate via the monitor subsystem.
+				const watchCount = params.logWatches?.length ?? 0;
+				if (watchCount) monitors.armSugarWatches(t, procId, params.logWatches ?? [], { name });
 				// Point-of-need discovery: this job already alerts on failure; nudge the
 				// agent toward success/log-watch notifications only when it did not opt in,
 				// so it stops polling list/output. Suppressed once the feature is used.
-				const optedIntoNotify = (params.alertOnSuccess ?? false) || (params.alertOnKill ?? false) || watches.length > 0;
+				const optedIntoNotify = (params.alertOnSuccess ?? false) || (params.alertOnKill ?? false) || watchCount > 0;
 				const tip = optedIntoNotify
 					? ""
 					: "\nWill notify you automatically if it fails — do not poll. Pass alertOnSuccess and/or logWatches to also be notified on success or when a log line matches.";
@@ -172,6 +177,10 @@ export function setupProcessTool(ssh: SshContext): void {
 					alertOnKill: params.alertOnKill ?? saved.alertOnKill ?? false,
 					watches: params.logWatches ?? saved.watches ?? [],
 				};
+				// Fail fast on a bad regex BEFORE persisting cfg to notify.json, so an
+				// invalid pattern can never poison the job's persisted config (which would
+				// then trip every future rehydrate).
+				validateWatchPatterns(cfg.watches);
 				// Persist merged prefs and clear the notified marker so a finished job
 				// re-fires its completion exactly once for this explicit attach.
 				const persist = `d=${shQuote(dir)}; printf %s ${shQuote(JSON.stringify(cfg))} > "$d/notify.json"; rm -f "$d/notified"`;
@@ -184,9 +193,12 @@ export function setupProcessTool(ssh: SshContext): void {
 					alertOnSuccess: cfg.alertOnSuccess,
 					alertOnFailure: cfg.alertOnFailure,
 					alertOnKill: cfg.alertOnKill,
-					watches: buildWatchStates(cfg.watches),
-					offsets: { stdout: Number.parseInt(outStr, 10) || 0, stderr: Number.parseInt(errStr, 10) || 0 },
 				});
+				// Re-arm the job's logWatch monitors, seeking to current EOF so historical
+				// lines are not re-matched (mirrors the monitor rehydrate rule).
+				if (cfg.watches.length) {
+					monitors.armSugarWatches(t, params.id, cfg.watches, { offsets: { stdout: Number.parseInt(outStr, 10) || 0, stderr: Number.parseInt(errStr, 10) || 0 }, name: cfg.name });
+				}
 				return { content: [{ type: "text" as const, text: `Watching ${params.id} (${cfg.name}). Will notify on completion${cfg.watches.length ? " and matching log lines" : ""}.` }] };
 			}
 
@@ -218,9 +230,11 @@ export function setupProcessTool(ssh: SshContext): void {
 				return { content: [{ type: "text" as const, text: `stdout: ${dir}/stdout.log\nstderr: ${dir}/stderr.log\nrun script: ${dir}/run.sh` }], details: { stdout: `${dir}/stdout.log`, stderr: `${dir}/stderr.log`, script: `${dir}/run.sh` } };
 			}
 
-			// Agent-initiated kill: drop the poller first so it does not fire a
-			// spurious completion/kill notification for an expected teardown.
+			// Agent-initiated kill: drop the poller and any process-bound monitors first
+			// so they do not fire a spurious completion/watch notification for an expected
+			// teardown.
 			poller.stopPoller(params.id);
+			monitors.stopForProcess(params.id);
 			const r = await runRemoteCommand(t, buildKillCommand(dir), { signal });
 			if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
 			return { content: [{ type: "text" as const, text: r.stdout.toString().trim() }] };

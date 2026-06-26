@@ -118,7 +118,8 @@ never loop on `list`/`output`:
   `alertOnKill` (default `false`) — fire on exit, classified by exit code
   (`0` success / `>=128` or missing `exit_code` killed / other failure).
 - `logWatches: [{ pattern, stream?, repeat? }]` — fire when a remote log line
-  matches a regex (`stream` default `both`, `repeat` default one-shot).
+  matches a regex (`stream` default `both`, `repeat` default one-shot). This is
+  sugar: each watch becomes a process-bound **monitor** (see `ssh_monitor`).
 
 Completion notifications report the run duration and, when a **newer run of the
 same `name`** was started after this one, tag the alert
@@ -146,6 +147,35 @@ for a job started earlier.
 `ssh_process output` accepts `followSeconds: N` to stream new stdout/stderr lines
 live for N seconds (remote `timeout … tail -F`) before returning the snapshot —
 better than re-polling `output` to watch progress.
+
+## Runtime log monitors (`ssh_monitor`)
+
+`create | list | update | pause | resume | remove | attach`. A **monitor** is a
+first-class, runtime-manageable log watch decoupled from `ssh_process`: unlike
+`logWatches` (frozen at `start`), you can attach one to **any** running job by id
+at **any** time, then change/pause/remove it without restarting the job.
+
+```
+ssh_monitor create  source=process:<procId>:stderr  pattern='Traceback'        # -> mon_…
+ssh_monitor create  source=process:<procId>:both     pattern='loss=' repeat=true name=loss
+ssh_monitor list
+ssh_monitor pause   <mon_id>     # resume / remove likewise
+ssh_monitor update  <mon_id>  pattern='NaN|inf'      # standalone monitors only
+```
+
+- **Source** is `process:<procId>[:stdout|stderr|both]` (stream defaults to
+  `both`); get `<procId>` from `ssh_process list`. (Phase 1 is process-source
+  only; `file:`/`probe:` sources land later.)
+- Matching **seeks to the log's current end** at create, so a monitor attached to
+  an already-running job fires only on **new** lines, never historical ones.
+- **Standalone** monitors persist to `<remote-cwd>/.pi-ssh-monitors/<id>.json`
+  and **re-arm on every (re)connect / pi restart** (seeking each source to EOF),
+  exactly like process completion notifications. They auto-remove when their
+  bound process is cleared or exits.
+- A monitor created from `ssh_process logWatches` is shown in `list` tagged
+  `(ssh_process)`; it lives in the job's `notify.json`. `update` only edits
+  standalone monitors; `pause/resume/remove` on a sugar monitor are
+  session-scoped (reset on the next reconnect, driven by `notify.json`).
 
 ## Transfer (`ssh_push` / `ssh_pull`)
 

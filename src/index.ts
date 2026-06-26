@@ -59,10 +59,12 @@ import { setupConnectionTools } from "./tools/connection";
 import { setupFsTools } from "./tools/fs";
 import { setupBashTool } from "./tools/bash";
 import { setupProcessTool } from "./tools/process";
+import { setupMonitorTool } from "./tools/monitor";
 import { setupTransferTools } from "./tools/transfer";
 import { setupHooks } from "./hooks";
 import { setupDashboard } from "./dashboard";
 import { createPollerManager } from "./poller";
+import { createMonitorManager } from "./monitor";
 import {
 	listProcesses,
 } from "./process-queries";
@@ -79,6 +81,8 @@ export default function (pi: ExtensionAPI) {
 
 	// Background ssh_process notification poller (owns pollers + latestStartByName).
 	const poller = createPollerManager(pi);
+	// Runtime-managed log monitors (decoupled from ssh_process; owns its own store).
+	const monitors = createMonitorManager(pi);
 	// Agent-facing notification sink shared by the poller and the sync watcher.
 	const emit = (content: string, details: Record<string, unknown>): void => sendProcessMessage(pi, content, details);
 
@@ -298,18 +302,22 @@ export default function (pi: ExtensionAPI) {
 		// never silently drops a still-pending completion / log-watch notification.
 		if (prev && prev.remote === next.remote && prev.remoteCwd === next.remoteCwd) {
 			poller.repointAll(next);
+			monitors.repointAll(next);
 		} else {
 			poller.stopAll();
+			monitors.stopAll();
 		}
 		if (prev) await closeMaster(prev);
 		target = next;
 		ctx.tunnels.stopAll();
 		await poller.rehydrate(next);
+		await monitors.rehydrate(next);
 		return next;
 	}
 
 	async function disconnect(): Promise<void> {
 		poller.stopAll();
+		monitors.stopAll();
 		ctx.sync.stop();
 		if (target) {
 			ctx.tunnels.stopAll();
@@ -368,6 +376,7 @@ export default function (pi: ExtensionAPI) {
 		getTarget: get,
 		requireTarget,
 		poller,
+		monitors,
 		emit,
 		render,
 		connect,
@@ -392,6 +401,7 @@ export default function (pi: ExtensionAPI) {
 	setupFsTools(ctx);
 	setupBashTool(ctx);
 	setupProcessTool(ctx);
+	setupMonitorTool(ctx);
 	setupTransferTools(ctx);
 
 	// --- session hooks + /ssh dashboard command ---

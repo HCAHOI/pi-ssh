@@ -16,18 +16,12 @@ export interface SshTarget {
 	originArg?: string;
 }
 
+// logWatches param shape on ssh_process; also the persisted home of process-bound
+// monitors inside a job's notify.json (desugared by src/monitor.ts).
 export interface WatchSpec {
 	pattern: string;
 	stream?: "stdout" | "stderr" | "both";
 	repeat?: boolean;
-}
-
-export interface WatchState {
-	re: RegExp;
-	pattern: string;
-	stream: "stdout" | "stderr" | "both";
-	repeat: boolean;
-	fired: boolean;
 }
 
 export interface PollerState {
@@ -38,8 +32,6 @@ export interface PollerState {
 	alertOnSuccess: boolean;
 	alertOnFailure: boolean;
 	alertOnKill: boolean;
-	watches: WatchState[];
-	off: { stdout: number; stderr: number };
 	timer: NodeJS.Timeout | null;
 	busy: boolean;
 	finished: boolean;

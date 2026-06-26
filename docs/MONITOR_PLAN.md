@@ -224,8 +224,14 @@ Priority by value/effort:
   runtime-verified. `index.ts` 2858 → 400; 21 modules; watch engine in
   `poller.ts`, sink in `notify.ts`, `setup*(ctx)` seam. Detail +
   outcome in `REFACTOR_SPLIT_PLAN.md`.
-- **Phase 1 — `ssh_monitor` tool + standalone monitor store + rehydrate.** ← NEXT.
-  Process-source only. Mid-run create/update/pause/remove now possible.
+- **Phase 1 — `ssh_monitor` tool + standalone monitor store + rehydrate.** ✅ **DONE.**
+  Process-source only. Mid-run create/update/pause/resume/remove now possible.
+  Watches lifted out of `PollerState` into a standalone `MonitorManager`
+  (`src/monitor.ts`) with one shared scheduler; the poller is completion-only.
+  `ssh_process --logWatches` desugars to process-bound monitors (`<procId>#w<i>`,
+  persisted in the job's `notify.json`); standalone monitors persist to
+  `.pi-ssh-monitors/<id>.json`. Both rehydrate on (re)connect, seeking each source
+  to EOF. See §9 decisions + accepted trade-offs below.
 - **Phase 2 — Notify policy + captures (roadmap 1).** Spam fix ships.
 - **Phase 3 — `file:`/`probe:` sources + silence (roadmap 3,4).**
 - **Phase 4 — digest/ETA, routing (roadmap 5,6).**
@@ -235,20 +241,38 @@ process-bound `MonitorSpec` with `{ mode:"every-match" }`.
 
 ---
 
-## 9. Open questions (resolve before Phase 2)
+## 9. Open questions
 
-1. **Expression evaluator** for `notifyWhen`/`probeWhen`: tiny safe parser over a
-   fixed variable set (captures + `value`/`exitCode` + `matchCount` + `elapsedMs`).
-   No `eval`.
-2. **One shared monitor timer vs per-monitor `setInterval`** — pollers are
-   per-job today; a single monitor scheduler is cheaper at scale. Pick one.
-3. **Monitor ↔ process lifecycle**: when the bound process is cleared/gone,
-   auto-remove its process-source monitors? (Yes — mirror the `gone` → stopPoller
-   path.)
-4. **Group sources**: binding one monitor to several processes (the "50 subtasks
-   as one job" digest case) — explicit id list vs name glob.
-5. **`ssh_monitor` vs extending `ssh_process`**: separate tool (recommended) vs a
-   new `monitor`-ish action set on `ssh_process`.
+Phase 1 decisions (resolved):
+
+1. **Expression evaluator** for `notifyWhen`/`probeWhen` — **deferred to Phase 2/3**
+   (Phase 1 has no `notifyWhen`/`probe`). Will be a tiny safe parser over a fixed
+   variable set; no `eval`.
+2. **One shared monitor timer vs per-monitor `setInterval`** — **one shared
+   `setInterval`** that kicks each monitor's `sweepMonitor` concurrently under a
+   per-monitor `busy` guard (single timer, no head-of-line blocking).
+3. **Monitor ↔ process lifecycle** — **yes, auto-remove.** A process-bound
+   monitor tears down (and deletes its persisted file) when its process dir is
+   `gone`; on `done` it does one final sweep then stops. `ssh_process kill` calls
+   `monitors.stopForProcess` to suppress spurious trailing alerts (mirrors
+   `poller.stopPoller`).
+4. **Group sources (N:M)** — **deferred** (Phase 1 = one process source per
+   monitor).
+5. **`ssh_monitor` vs extending `ssh_process`** — **separate `ssh_monitor` tool.**
+
+Accepted Phase 1 trade-offs (revisit in later phases):
+
+- **Ordering:** the completion poller and each monitor run on independent timers,
+  so a process's final matching line and its completion alert may arrive in either
+  order. Trailing lines are never lost (the monitor sweeps the delta when it
+  observes `done`, before teardown) — only relative ordering is unguaranteed.
+- **SSH amplification:** each monitor independently issues `procStatus` +
+  per-stream `fetchDelta` every tick, so k logWatches on a job cost ~k× the SSH
+  round-trips the old single-poller sweep did. Fine at Phase 1 scale; a future
+  optimization can coalesce status/delta across monitors sharing a procId+stream.
+- **Sugar-monitor mutability:** `ssh_monitor update` rejects process-sugar
+  monitors (their source of truth is `notify.json`); `pause/resume/remove` on them
+  are session-scoped and reset on the next rehydrate.
 
 ---
 
