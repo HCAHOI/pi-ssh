@@ -40,13 +40,12 @@
  *   - bash on remote; python3 on remote for efficient in-place edit
  */
 
-import { spawn } from "node:child_process";
-import { type FSWatcher, mkdirSync, readFileSync, watch, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { Type } from "typebox";
-import type { AgentToolUpdateCallback, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, type SelectItem, SelectList, truncateToWidth } from "@earendil-works/pi-tui";
 import {
 	createBashTool,
@@ -61,7 +60,6 @@ import {
 
 import type {
 	Activation,
-	RunResult,
 	SshTarget,
 	WatchSpec,
 	WatchState,
@@ -85,17 +83,14 @@ import {
 	runRemoteGrep,
 } from "./remote-ops";
 import { setReconnectNotifier, withReconnect } from "./ssh/reconnect";
-import {
-	baseSshOptions,
-	closeMaster,
-	runRemoteCommand,
-	runSsh,
-	sshFailureMessage,
-} from "./ssh/transport";
+import { closeMaster, runRemoteCommand, sshFailureMessage } from "./ssh/transport";
 import { resolveTarget } from "./ssh/target";
 import { sendProcessMessage } from "./notify";
 import { createRender } from "./render";
 import { ensureTrailingSlash, runRsyncTransfer, rsyncStreamer } from "./transfer";
+import type { SshContext } from "./context";
+import { createTunnelManager, type TunnelManager } from "./tunnels";
+import { createSyncManager, type SyncManager } from "./sync";
 import { buildWatchStates, createPollerManager, type NotifyConfig } from "./poller";
 import {
 	buildClearCommand,
@@ -353,16 +348,16 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (prev) await closeMaster(prev);
 		target = next;
-		stopAllTunnels();
+		ctx.tunnels.stopAll();
 		await poller.rehydrate(next);
 		return next;
 	}
 
 	async function disconnect(): Promise<void> {
 		poller.stopAll();
-		stopSyncWatcher();
+		ctx.sync.stop();
 		if (target) {
-			stopAllTunnels();
+			ctx.tunnels.stopAll();
 			await closeMaster(target);
 		}
 		target = null;
@@ -409,6 +404,32 @@ export default function (pi: ExtensionAPI) {
 	// Tool-call rendering helpers, bound to the active target getter.
 	const render = createRender(get, localCwd);
 	const { str, remoteDisplayPath, accentRemotePath, readLineRange, sshTitle, renderEditDiffResult } = render;
+
+	// Shared context handed to every subsystem/tool module. Managers are attached
+	// just below (they capture ctx lazily, so the forward reference is safe).
+	const ctx: SshContext = {
+		pi,
+		localCwd,
+		getTarget: get,
+		requireTarget,
+		poller,
+		emit,
+		render,
+		connect,
+		switchTarget,
+		disconnect,
+		refreshStatus,
+		connectedText,
+		statusLabel,
+		profileNames,
+		saveProfile,
+		expandProfile,
+		buildSshBashCommand,
+		tunnels: undefined as unknown as TunnelManager,
+		sync: undefined as unknown as SyncManager,
+	};
+	ctx.tunnels = createTunnelManager(ctx);
+	ctx.sync = createSyncManager(ctx);
 
 	// --- agent-callable connection management ---
 	pi.registerTool({
@@ -1012,189 +1033,6 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// ---------------------------------------------------------------------------
-	// Port forwarding (ssh_tunnel) — local port <- remote port over the master
-	// ---------------------------------------------------------------------------
-	interface TunnelState { localPort: number; remoteHost: string; remotePort: number; spec: string; }
-	const tunnels = new Map<number, TunnelState>();
-
-	function tunnelControl(t: SshTarget, action: "forward" | "cancel", spec: string): Promise<RunResult> {
-		// `ssh -O forward/cancel -L <spec> host` asks the running ControlMaster to open
-		// or close a forward without spawning a new session.
-		return runSsh([...t.sshOptions, ...baseSshOptions(t.socket), "-O", action, "-L", spec, "--", t.remote], { timeout: 10 });
-	}
-
-	function stopAllTunnels(): void {
-		if (!target) {
-			tunnels.clear();
-			return;
-		}
-		for (const tn of tunnels.values()) void tunnelControl(target, "cancel", tn.spec).catch(() => {});
-		tunnels.clear();
-	}
-
-	pi.registerTool({
-		name: "ssh_tunnel",
-		label: "ssh_tunnel",
-		description: "Port-forward a remote port to a local port over the shared SSH connection, so a remote dev server / TensorBoard / Jupyter / web UI is reachable from the local browser at http://localhost:<localPort>. Actions: open | close | list. Tunnels are closed automatically on disconnect.",
-		promptSnippet: "Forward a remote port to localhost over SSH",
-		promptGuidelines: ["Use ssh_tunnel open to view a remote web UI / dev server / TensorBoard locally; close it with ssh_tunnel close when done."],
-		parameters: Type.Object({
-			action: Type.Union([Type.Literal("open"), Type.Literal("close"), Type.Literal("list")]),
-			localPort: Type.Optional(Type.Number({ description: "Local port to bind (open/close). Defaults to remotePort." })),
-			remotePort: Type.Optional(Type.Number({ description: "Remote port to forward (required for open)" })),
-			remoteHost: Type.Optional(Type.String({ description: "Remote-side host the port lives on (default 127.0.0.1)" })),
-		}),
-		renderCall(args: any, theme: any, context: any) {
-			const a = str(args?.action) || "?";
-			if (a === "open" || a === "close") {
-				const lp = args?.localPort ?? args?.remotePort;
-				const spec = `${lp ?? "?"}:${args?.remoteHost ?? "127.0.0.1"}:${args?.remotePort ?? "?"}`;
-				return sshTitle("tunnel", `${theme.fg("accent", a)} ${theme.fg("muted", spec)}`, theme, context);
-			}
-			return sshTitle("tunnel", theme.fg("accent", a), theme, context);
-		},
-		async execute(_id, params: { action: "open" | "close" | "list"; localPort?: number; remotePort?: number; remoteHost?: string }) {
-			const t = requireTarget();
-			if (params.action === "list") {
-				if (tunnels.size === 0) return { content: [{ type: "text" as const, text: "No active tunnels." }] };
-				const text = [...tunnels.values()].map((tn) => `localhost:${tn.localPort} -> ${t.remote} ${tn.remoteHost}:${tn.remotePort}`).join("\n");
-				return { content: [{ type: "text" as const, text }] };
-			}
-			const remoteHost = params.remoteHost?.trim() || "127.0.0.1";
-			if (params.action === "open") {
-				if (!params.remotePort) throw new Error("ssh_tunnel open requires remotePort");
-				const localPort = params.localPort ?? params.remotePort;
-				const spec = `${localPort}:${remoteHost}:${params.remotePort}`;
-				if (tunnels.has(localPort)) throw new Error(`Local port ${localPort} already forwarded; close it first.`);
-				const r = await tunnelControl(t, "forward", spec);
-				if (r.code !== 0) throw new Error(`Tunnel open failed: ${r.stderr.toString().trim() || r.stdout.toString().trim() || sshFailureMessage(r)}`);
-				tunnels.set(localPort, { localPort, remoteHost, remotePort: params.remotePort, spec });
-				return { content: [{ type: "text" as const, text: `Tunnel open: http://localhost:${localPort} -> ${t.remote} ${remoteHost}:${params.remotePort}` }] };
-			}
-			// close
-			const localPort = params.localPort ?? params.remotePort;
-			if (!localPort) throw new Error("ssh_tunnel close requires localPort (or remotePort)");
-			const tn = tunnels.get(localPort);
-			if (!tn) throw new Error(`No tunnel on local port ${localPort}.`);
-			const r = await tunnelControl(t, "cancel", tn.spec);
-			tunnels.delete(localPort);
-			if (r.code !== 0) throw new Error(`Tunnel close reported: ${r.stderr.toString().trim() || sshFailureMessage(r)}`);
-			return { content: [{ type: "text" as const, text: `Tunnel closed: localhost:${localPort}` }] };
-		},
-	});
-
-	// ---------------------------------------------------------------------------
-	// Auto-sync (ssh_sync) — debounced rsync of the local workspace on change
-	// ---------------------------------------------------------------------------
-	interface SyncState {
-		watcher: FSWatcher;
-		localSource: string;
-		remoteDest: string;
-		remote: string;
-		debounceMs: number;
-		delete: boolean;
-		excludes?: string[];
-		timer: NodeJS.Timeout | null;
-		syncing: boolean;
-		pending: boolean;
-		count: number;
-	}
-	let syncState: SyncState | null = null;
-
-	function stopSyncWatcher(): void {
-		if (!syncState) return;
-		if (syncState.timer) clearTimeout(syncState.timer);
-		try { syncState.watcher.close(); } catch { /* already closed */ }
-		syncState = null;
-	}
-
-	async function runSync(s: SyncState): Promise<void> {
-		if (!target || target.remote !== s.remote) { stopSyncWatcher(); return; }
-		if (s.syncing) { s.pending = true; return; }
-		s.syncing = true;
-		try {
-			await runRsyncTransfer(localCwd, target, s.localSource, `${s.remote}:${s.remoteDest}`, { delete: s.delete, excludes: s.excludes, gitignore: true, quiet: true });
-			s.count += 1;
-		} catch (e) {
-			emit(`⚠️ ssh_sync failed: ${e instanceof Error ? e.message : String(e)}`, { kind: "sync-error" });
-		} finally {
-			s.syncing = false;
-			if (s.pending) { s.pending = false; scheduleSync(s); }
-		}
-	}
-
-	function scheduleSync(s: SyncState): void {
-		if (s.timer) clearTimeout(s.timer);
-		s.timer = setTimeout(() => { s.timer = null; void runSync(s); }, s.debounceMs);
-		s.timer.unref?.();
-	}
-
-	// Start (or restart) the auto-sync watcher. Shared by the ssh_sync tool and the
-	// /ssh dashboard's sync toggle so there is one copy of the rsync+watch setup.
-	async function startSync(
-		t: SshTarget,
-		params: { localPath?: string; remotePath?: string; debounceMs?: number; delete?: boolean; excludes?: string[] },
-	): Promise<{ localSource: string; remoteDest: string; debounceMs: number; initialTail: string }> {
-		stopSyncWatcher();
-		const localSource = ensureTrailingSlash(resolve(localCwd, params.localPath ?? "."));
-		const remoteDest = ensureTrailingSlash(params.remotePath ? toRemotePath(params.remotePath, localCwd, t.remoteCwd) : t.remoteCwd);
-		// Initial full sync so the remote starts in lockstep.
-		const initial = await runRsyncTransfer(localCwd, t, localSource, `${t.remote}:${remoteDest}`, { delete: params.delete, excludes: params.excludes, gitignore: true }, undefined);
-		const debounceMs = Math.max(50, Math.floor(params.debounceMs ?? 400));
-		let watcher: FSWatcher;
-		try {
-			watcher = watch(resolve(localCwd, params.localPath ?? "."), { recursive: true });
-		} catch (e) {
-			throw new Error(`ssh_sync could not watch ${localSource}: ${e instanceof Error ? e.message : String(e)} (recursive fs.watch requires macOS/Windows; on Linux use ssh_push)`);
-		}
-		const s: SyncState = { watcher, localSource, remoteDest, remote: t.remote, debounceMs, delete: params.delete ?? false, excludes: params.excludes, timer: null, syncing: false, pending: false, count: 0 };
-		watcher.on("change", (_event, file) => {
-			// Cheap noise filter: skip VCS/build churn that rsync would exclude anyway.
-			const name = typeof file === "string" ? file : file?.toString() ?? "";
-			if (/(^|\/)\.git\/|(^|\/)node_modules\/|~$|\.swp$/.test(name)) return;
-			scheduleSync(s);
-		});
-		watcher.on("error", (e) => emit(`⚠️ ssh_sync watcher error: ${e instanceof Error ? e.message : String(e)}`, { kind: "sync-error" }));
-		syncState = s;
-		return { localSource, remoteDest, debounceMs, initialTail: initial.stdout.split("\n").slice(-3).join("\n") };
-	}
-
-	pi.registerTool({
-		name: "ssh_sync",
-		label: "ssh_sync",
-		description: "Auto-sync the local workspace to the active SSH remote on every local file change (debounced rsync, .gitignore-filtered). Removes the manual ssh_push step from the edit-locally/run-remotely loop. Actions: start | stop | status. Only one watcher at a time; stops on disconnect.",
-		promptSnippet: "Continuously rsync local edits to the remote on change",
-		promptGuidelines: ["Use ssh_sync start to keep the remote in lockstep with local edits instead of calling ssh_push after every change; stop it when done."],
-		parameters: Type.Object({
-			action: Type.Union([Type.Literal("start"), Type.Literal("stop"), Type.Literal("status")]),
-			localPath: Type.Optional(Type.String({ description: "Local path to watch+sync, defaults to current workspace" })),
-			remotePath: Type.Optional(Type.String({ description: "Remote destination path, defaults to remote cwd" })),
-			debounceMs: Type.Optional(Type.Number({ description: "Quiet period after a change before syncing (default 400)" })),
-			delete: Type.Optional(Type.Boolean({ description: "Mirror local deletions to the remote (default false)" })),
-			excludes: Type.Optional(Type.Array(Type.String(), { description: "Additional rsync exclude patterns" })),
-		}),
-		renderCall(args: any, theme: any, context: any) {
-			const a = str(args?.action) || "?";
-			const where = a === "start" ? ` ${theme.fg("muted", str(args?.localPath) || ".")}` : "";
-			return sshTitle("sync", `${theme.fg("accent", a)}${where}`, theme, context);
-		},
-		async execute(_id, params: { action: "start" | "stop" | "status"; localPath?: string; remotePath?: string; debounceMs?: number; delete?: boolean; excludes?: string[] }) {
-			const t = requireTarget();
-			if (params.action === "status") {
-				if (!syncState) return { content: [{ type: "text" as const, text: "ssh_sync: not running." }] };
-				return { content: [{ type: "text" as const, text: `ssh_sync: watching ${syncState.localSource} -> ${syncState.remote}:${syncState.remoteDest} (${syncState.count} syncs so far)` }] };
-			}
-			if (params.action === "stop") {
-				const was = syncState ? `${syncState.count}` : null;
-				stopSyncWatcher();
-				return { content: [{ type: "text" as const, text: was === null ? "ssh_sync was not running." : `ssh_sync stopped (${was} syncs).` }] };
-			}
-			// start
-			const { localSource, remoteDest, debounceMs, initialTail } = await startSync(t, params);
-			return { content: [{ type: "text" as const, text: `ssh_sync started: ${localSource} -> ${t.remote}:${remoteDest} (debounce ${debounceMs}ms).\n${initialTail}` }] };
-		},
-	});
 
 
 	// --- startup flag ---
@@ -1325,11 +1163,13 @@ export default function (pi: ExtensionAPI) {
 			push(`  ${T.fg("success", "\u25cf")} ${T.fg("text", "connected")}  ${T.fg("accent", `${t.remote} : ${t.remoteCwd}`)}${t.hasPython ? "" : T.fg("warning", "  (no python3)")}`);
 			if (t.defaultCommandPrefix) push(`    ${T.fg("dim", "\u26a1")} ${T.fg("muted", t.defaultCommandPrefix)}`);
 			if (t.defaultEnv && Object.keys(t.defaultEnv).length) push(`    ${T.fg("dim", "env")}  ${T.fg("muted", Object.keys(t.defaultEnv).join(", "))}`);
-			if (tunnels.size) {
-				const tn = [...tunnels.values()].map((x) => `localhost:${x.localPort}\u2192${x.remoteHost}:${x.remotePort}`).join(", ");
+			const activeTunnels = ctx.tunnels.list();
+			if (activeTunnels.length) {
+				const tn = activeTunnels.map((x) => `localhost:${x.localPort}\u2192${x.remoteHost}:${x.remotePort}`).join(", ");
 				push(`    ${T.fg("dim", "tunnels")}  ${T.fg("muted", tn)}`);
 			}
-			if (syncState) push(`    ${T.fg("dim", "sync")}  ${T.fg("muted", `watching ${syncState.localSource} (${syncState.count} syncs)`)}`);
+			const syncStatus = ctx.sync.getState();
+			if (syncStatus) push(`    ${T.fg("dim", "sync")}  ${T.fg("muted", `watching ${syncStatus.localSource} (${syncStatus.count} syncs)`)}`);
 			push("");
 			const statusHint = this.err ? T.fg("warning", `\u26a0 ${this.err}`) : T.fg("dim", "\u21bb live");
 			push(`  ${T.fg("text", `Processes (${this.rows.length})`)}   ${statusHint}`);
@@ -1541,13 +1381,13 @@ export default function (pi: ExtensionAPI) {
 		private async toggleSync(): Promise<void> {
 			const t = target;
 			if (!t) return;
-			if (syncState) {
-				stopSyncWatcher();
+			if (ctx.sync.getState()) {
+				ctx.sync.stop();
 				this.tui.requestRender();
 				return;
 			}
 			try {
-				await startSync(t, {});
+				await ctx.sync.startSync(t, {});
 			} catch (e) {
 				this.err = e instanceof Error ? e.message : String(e);
 			}
