@@ -18,11 +18,15 @@ import { runRemoteCommand } from "./ssh/transport";
 import { processRoot } from "./process-queries";
 
 // The source union. Phase 3 widens this; `process` stays first/unchanged.
-export type MonitorSource = { kind: "process"; procId: string; stream: "stdout" | "stderr" | "both" };
+export type MonitorSource =
+	| { kind: "process"; procId: string; stream: "stdout" | "stderr" | "both" }
+	| { kind: "file"; path: string }; // absolute remote path
 
 // Per-source mutable runtime: offsets/clocks the driver advances each poll.
 // Replaces the bare process-only `dir`/`off` that lived on MonitorState.
-export type SourceRuntime = { kind: "process"; dir: string; off: Record<string, number> };
+export type SourceRuntime =
+	| { kind: "process"; dir: string; off: Record<string, number> }
+	| { kind: "file"; off: number };
 
 /** What one poll observed this tick. The engine turns this into matches/teardown. */
 export interface PollResult {
@@ -65,6 +69,13 @@ export function streamsOf(stream: "stdout" | "stderr" | "both"): Array<"stdout" 
 	return stream === "both" ? ["stdout", "stderr"] : [stream];
 }
 
+// Byte size of a remote file, or 0 if it does not exist (a missing file is normal
+// for process logs before the first write and for file sources pre-rotation).
+export async function wcBytes(t: SshTarget, file: string): Promise<number> {
+	const r = await runRemoteCommand(t, `wc -c < ${shQuote(file)} 2>/dev/null || echo 0`, { timeout: 20, login: false });
+	return r.code === 0 ? Number.parseInt(r.stdout.toString().trim(), 10) || 0 : 0;
+}
+
 // Read new complete lines appended to a remote file since `off`. Advances only to
 // the last newline so partial lines (and multibyte chars straddling the boundary)
 // are re-read intact next tick. Byte-offset based, so nothing logged during Mac
@@ -99,10 +110,7 @@ async function procStatus(t: SshTarget, dir: string): Promise<"running" | "done"
 
 async function eofOffsets(t: SshTarget, dir: string, stream: "stdout" | "stderr" | "both"): Promise<Record<string, number>> {
 	const off: Record<string, number> = {};
-	for (const s of streamsOf(stream)) {
-		const r = await runRemoteCommand(t, `wc -c < ${shQuote(`${dir}/${s}.log`)} 2>/dev/null || echo 0`, { timeout: 20, login: false });
-		off[s] = r.code === 0 ? Number.parseInt(r.stdout.toString().trim(), 10) || 0 : 0;
-	}
+	for (const s of streamsOf(stream)) off[s] = await wcBytes(t, `${dir}/${s}.log`);
 	return off;
 }
 
@@ -120,6 +128,7 @@ const ProcessSourceDriver: SourceDriver = {
 		if (status === "done") throw new Error(`Process ${source.procId} has already exited; a monitor only matches NEW log lines, so there is nothing to watch. Inspect past output with ssh_process output instead.`);
 	},
 	async initRuntime(t, source) {
+		if (source.kind !== "process") return processRuntime("", {});
 		// Seek to current EOF so a monitor attached to an already-running process does
 		// not re-fire on historical log lines (same rule as poller rehydrate).
 		const dir = procDir(t, source.procId);
@@ -127,6 +136,7 @@ const ProcessSourceDriver: SourceDriver = {
 		return processRuntime(dir, off);
 	},
 	async rehydrateRuntime(t, source, hints) {
+		if (source.kind !== "process") return processRuntime("", {});
 		const dir = procDir(t, source.procId);
 		const off: Record<string, number> = {};
 		for (const s of streamsOf(source.stream)) off[s] = s === "stdout" ? (hints?.outSize ?? 0) : (hints?.errSize ?? 0);
@@ -155,19 +165,70 @@ const ProcessSourceDriver: SourceDriver = {
 	},
 };
 
+// --- file source -----------------------------------------------------------
+
+const FileSourceDriver: SourceDriver = {
+	async validate(_t, source) {
+		if (source.kind !== "file") return;
+		// A file source never rejects on a missing path (logrotate / not-yet-created are
+		// normal); it just polls and picks the file up when it appears. Only reject a
+		// path that isn't an absolute remote path.
+		if (!source.path.startsWith("/")) throw new Error(`file source path must be an absolute remote path, got "${source.path}".`);
+	},
+	async initRuntime(t, source) {
+		if (source.kind !== "file") return { kind: "file", off: 0 };
+		// Seek to current EOF so historical lines do not re-fire.
+		return { kind: "file", off: await wcBytes(t, source.path) };
+	},
+	async rehydrateRuntime(t, source) {
+		if (source.kind !== "file") return { kind: "file", off: 0 };
+		// Defensive: a hand-edited/corrupt persisted file path that isn't absolute is
+		// dropped by the rehydrate loop's catch rather than wc'd against the login cwd.
+		if (!source.path.startsWith("/")) throw new Error(`file source path must be absolute, got "${source.path}".`);
+		return { kind: "file", off: await wcBytes(t, source.path) };
+	},
+	async poll(t, source, srt, opts) {
+		if (source.kind !== "file" || srt.kind !== "file") return {};
+		// A latched one-shot probes nothing here (no liveness to track) and keeps its
+		// offset frozen so a pattern re-arm re-scans the lines logged while latched.
+		if (!opts.readDeltas) return {};
+		// Detect rotation/truncation: if the file is now smaller than our offset (default
+		// logrotate mv+recreate, or copytruncate to 0), the absolute byte offset is stale
+		// — reset to 0 so we re-read the fresh file from its start instead of going blind
+		// until it regrows past the old offset (§2.4 logrotate-tolerated).
+		const size = await wcBytes(t, source.path);
+		if (size < srt.off) srt.off = 0;
+		// fetchDelta tolerates a missing file (returns no lines, offset unchanged), so an
+		// absent file is handled transparently and re-read when it reappears. A file
+		// source never ends or vanishes — only an explicit remove tears it down.
+		const { lines, nextOff } = await fetchDelta(t, source.path, srt.off);
+		if (nextOff !== srt.off) srt.off = nextOff;
+		return { matches: lines.map((line) => ({ line })) };
+	},
+};
+
 export const DRIVERS: Record<MonitorSource["kind"], SourceDriver> = {
 	process: ProcessSourceDriver,
+	file: FileSourceDriver,
 };
 
 export function sourceLabel(s: MonitorSource): string {
-	return `process:${s.procId}:${s.stream}`;
+	return s.kind === "process" ? `process:${s.procId}:${s.stream}` : `file:${s.path}`;
 }
 
-/** Parse a `process:<procId>[:<stream>]` source string. Stream defaults to "both". */
+/** Parse a `process:<procId>[:<stream>]` or `file:<absolute-path>` source string. */
 export function parseSource(raw: string): MonitorSource {
 	const text = raw.trim();
+	if (text.startsWith("file:")) {
+		// Everything after `file:` is the path verbatim (absolute remote path; may
+		// legitimately contain spaces/colons — do NOT split on ':').
+		const path = text.slice("file:".length).trim();
+		if (!path) throw new Error(`Invalid --source "${raw}": missing file path.`);
+		if (!path.startsWith("/")) throw new Error(`file source path must be an absolute remote path, got "${path}".`);
+		return { kind: "file", path };
+	}
 	if (!text.startsWith("process:")) {
-		throw new Error(`Unsupported --source "${raw}". Phase 1 supports process:<procId>[:stdout|stderr|both].`);
+		throw new Error(`Unsupported --source "${raw}". Use process:<procId>[:stdout|stderr|both] or file:<absolute-path>.`);
 	}
 	const rest = text.slice("process:".length);
 	const lastColon = rest.lastIndexOf(":");

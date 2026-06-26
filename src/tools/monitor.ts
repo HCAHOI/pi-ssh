@@ -31,16 +31,16 @@ export function setupMonitorTool(ssh: SshContext): void {
 		name: "ssh_monitor",
 		label: "ssh_monitor",
 		description:
-			"Runtime-managed log monitors on the active SSH remote, decoupled from ssh_process. A monitor watches a running job's stdout/stderr for a regex and notifies you (re-engaging the agent) when a line matches — created/changed/paused/removed at any time, bound to any job's id (not frozen at start like ssh_process logWatches). A notify policy controls HOW matches map to notifications, killing spam: every-match (default) | every-n:N | throttle:DUR | digest:DUR | milestone:f1,f2,… (milestone needs a (?<total>…) capture). Named regex groups (e.g. (?<n>\\d+)/(?<total>\\d+)) feed an optional {token} template and digest/milestone ETA. Standalone monitors persist and re-arm on reconnect/pi-restart; matching seeks to the log's current end so history does not re-fire. Source is process:<procId>[:stdout|stderr|both] (from ssh_process list). Actions: create/list/update/pause/resume/remove/attach.",
+			"Runtime-managed log monitors on the active SSH remote, decoupled from ssh_process. A monitor watches a running job's stdout/stderr for a regex and notifies you (re-engaging the agent) when a line matches — created/changed/paused/removed at any time, bound to any job's id (not frozen at start like ssh_process logWatches). A notify policy controls HOW matches map to notifications, killing spam: every-match (default) | every-n:N | throttle:DUR | digest:DUR | milestone:f1,f2,… (milestone needs a (?<total>…) capture). Named regex groups (e.g. (?<n>\\d+)/(?<total>\\d+)) feed an optional {token} template and digest/milestone ETA. Standalone monitors persist and re-arm on reconnect/pi-restart; matching seeks to the source's current end so history does not re-fire. Source is process:<procId>[:stdout|stderr|both] (from ssh_process list) OR file:<absolute-remote-path> to watch any remote file (logrotate/not-yet-created tolerated; never self-removes). Actions: create/list/update/pause/resume/remove/attach.",
 		promptSnippet: "Manage runtime log monitors on the SSH remote",
 		promptGuidelines: [
-			"Use ssh_monitor create source=process:<id>:stderr pattern='<regex>' to watch a running ssh_process job for a log line without restarting it.",
+			"Use ssh_monitor create source=process:<id>:stderr pattern='<regex>' to watch a running ssh_process job for a log line without restarting it; use source=file:/abs/path to watch any remote file (logrotate-safe, never self-removes).",
 			"For a noisy/progress line, add a notify policy to avoid spam: notify=digest:5m, notify=every-n:50, notify=throttle:60s, or notify=milestone:0.25,0.5,1.0 (needs a (?<total>…) capture).",
 			"Monitors notify you when the policy fires — rely on the notification instead of polling ssh_process output. Use list/pause/resume/remove to manage them; standalone monitors survive reconnect.",
 		],
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("create"), Type.Literal("list"), Type.Literal("update"), Type.Literal("pause"), Type.Literal("resume"), Type.Literal("remove"), Type.Literal("attach")]),
-			source: Type.Optional(Type.String({ description: "create: signal source, process:<procId>[:stdout|stderr|both] (stream defaults to both)" })),
+			source: Type.Optional(Type.String({ description: "create: signal source — process:<procId>[:stdout|stderr|both] (stream defaults to both) or file:<absolute-remote-path>" })),
 			pattern: Type.Optional(Type.String({ description: "create/update: regex matched per log line; named groups (?<x>…) become {x} template/ETA vars" })),
 			repeat: Type.Optional(Type.Boolean({ description: "create/update: fire on every match (default false: one-shot). Ignored unless notify=every-match." })),
 			name: Type.Optional(Type.String({ description: "create/update: friendly label for the monitor" })),
@@ -75,7 +75,7 @@ export function setupMonitorTool(ssh: SshContext): void {
 			const t = requireTarget();
 
 			if (params.action === "create") {
-				if (!params.source?.trim()) throw new Error("ssh_monitor create requires source (e.g. process:<procId>:stderr)");
+				if (!params.source?.trim()) throw new Error("ssh_monitor create requires source (e.g. process:<procId>:stderr or file:/var/log/app.log)");
 				if (!params.pattern?.trim()) throw new Error("ssh_monitor create requires pattern");
 				const source = parseSource(params.source);
 				const notify = parseNotifyPolicy(params.notify);

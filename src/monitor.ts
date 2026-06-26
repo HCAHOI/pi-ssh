@@ -200,10 +200,13 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 	function emitMonitor(m: MonitorState, d: GateDecision, stream?: "stdout" | "stderr", line?: string): void {
 		const label = m.name ? `"${m.name}" (${m.id})` : m.id;
 		const where = stream ? ` on ${stream}` : "";
-		emit(`🔔 ssh_monitor ${label} /${m.pattern}/${where} (process ${m.source.procId}):\n${d.text ?? ""}`, {
+		const src = m.source;
+		const srcDesc = src.kind === "process" ? `process ${src.procId}` : `file ${src.path}`;
+		emit(`🔔 ssh_monitor ${label} /${m.pattern}/${where} (${srcDesc}):\n${d.text ?? ""}`, {
 			kind: "monitor",
 			monitorId: m.id,
-			procId: m.source.procId,
+			source: sourceLabel(src),
+			...(src.kind === "process" ? { procId: src.procId } : {}),
 			...(stream ? { stream } : {}),
 			...(line !== undefined ? { line } : {}),
 			pattern: m.pattern,
@@ -460,7 +463,7 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 
 	function stopForProcess(procId: string): void {
 		for (const m of [...monitors.values()]) {
-			if (m.source.procId === procId) void removeInternal(m);
+			if (m.source.kind === "process" && m.source.procId === procId) void removeInternal(m);
 		}
 	}
 
@@ -533,17 +536,25 @@ print(json.dumps({'monitors': mons, 'procs': procs}))
 			} catch {
 				continue;
 			}
-			if (!spec.id || monitors.has(spec.id) || spec.source?.kind !== "process") continue;
-			const proc = parsed.procs[spec.source.procId];
-			if (!proc) {
-				// Bound process is gone: drop the stale monitor file.
+			const source = spec.source;
+			if (!spec.id || monitors.has(spec.id) || (source?.kind !== "process" && source?.kind !== "file")) continue;
+			if (source.kind === "process" && !parsed.procs[source.procId]) {
+				// Bound process is gone: drop the stale monitor file. (file: sources have no
+				// bound process and are never reaped here — only an explicit remove drops them.)
 				await runRemoteCommand(t, `rm -f -- ${shQuote(`${mroot}/${spec.id}.json`)}`, { timeout: 20, login: false }).catch(() => {});
 				continue;
 			}
 			try {
-				// Seed offsets from the scan's known sizes (no extra wc -c round-trip).
-				const srt = await DRIVERS[spec.source.kind].rehydrateRuntime(t, spec.source, { outSize: proc.outSize, errSize: proc.errSize });
-				const state = buildState({ id: spec.id, kind: "standalone", source: spec.source, pattern: spec.pattern, repeat: !!spec.repeat, name: spec.name, paused: !!spec.paused, target: t, srt, notify: spec.notify, template: spec.template });
+				// Seek to EOF so history does not re-fire: process seeds from the scan's known
+				// sizes (no extra round-trip); file does a cheap per-monitor wc -c.
+				let srt: SourceRuntime;
+				if (source.kind === "process") {
+					const proc = parsed.procs[source.procId];
+					srt = await DRIVERS.process.rehydrateRuntime(t, source, { outSize: proc.outSize, errSize: proc.errSize });
+				} else {
+					srt = await DRIVERS.file.rehydrateRuntime(t, source);
+				}
+				const state = buildState({ id: spec.id, kind: "standalone", source, pattern: spec.pattern, repeat: !!spec.repeat, name: spec.name, paused: !!spec.paused, target: t, srt, notify: spec.notify, template: spec.template });
 				addMonitor(state);
 			} catch {
 				// A corrupt/invalid persisted monitor (e.g. bad regex) must not abort
