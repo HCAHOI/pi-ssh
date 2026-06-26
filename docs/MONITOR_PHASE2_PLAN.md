@@ -1,7 +1,8 @@
 # Phase 2: Notify Policy + Captures (kill the notification spam)
 
-> Status: design / not yet implemented. Builds on Phase 1 (`src/monitor.ts`,
-> runtime-verified, committed). Scope: this repo (`pi-ssh`). Remote-only.
+> Status: 2a ✅ + 2b/2c ✅ implemented (pending live smoke after a pi restart);
+> 2d (logWatches policies) optional/not started. Builds on Phase 1
+> (`src/monitor.ts`). Scope: this repo (`pi-ssh`). Remote-only.
 > North star: a monitor maps *matches* to *notifications* under a configurable
 > **NotifyPolicy**, using **named captures**, so `[1/50] DONE … [50/50] DONE`
 > becomes one digest / four milestones / a throttled trickle — not 50 pings.
@@ -201,19 +202,20 @@ ship logWatches policies as 2d only if cheap.
 
 ## 7. Sub-phases (each ends green: tsc baseline unchanged + smoke OK)
 
-- **2a — Pure helper + tests.** `src/notify-policy.ts`: `makeNotifyGate`,
-  `parseNotifyPolicy`, `parseDuration`, `renderTemplate`. **Add the project's
-  first unit tests here** (vitest, as REFACTOR_SPLIT_PLAN §6 recommended) — the
-  gate is pure, so policies/ETA/milestone-crossing are table-testable with zero
-  SSH. No engine wiring yet.
-- **2b — Captures.** `runMatch` `test`→`exec`; populate `m.captures`; surface in
-  the default body + `list`. Still `every-match` (no behavior change for users
-  who pass no policy).
-- **2c — Policy wiring.** Build the gate in `buildState`; `onMatch`/`onTick`/
-  `onClose` in `runMatch`/`sweepMonitor`; persist + rehydrate `notify`/`template`;
-  `create`/`update` validation; tool params + `parseNotifyPolicy`.
-- **2d — (optional) logWatches policies.** Extend `WatchSpec` + `ssh_process`
-  schema per §6.
+- **2a — Pure helper + tests.** ✅ `src/notify-policy.ts` (`makeNotifyGate`,
+  `parseNotifyPolicy`, `parseDuration`, `renderTemplate`) + `notify-policy.test.ts`
+  (14 cases, `node:test`, run via `npm test` = `tsx --test`). Used `node:test`
+  instead of vitest to keep the zero-dependency posture (no install). Pure gate,
+  zero SSH.
+- **2b/2c — Captures + policy wiring.** ✅ Shipped together (2b alone would leave
+  captures populated-but-unused). `runMatch` `test`→`exec` populates `m.captures`;
+  `buildState` builds the gate; `onMatch`/`onTick`/`onClose` wired in
+  `runMatch`/`sweepMonitor` (tick flush while running, close flush on `done`);
+  `notify`/`template` persisted in `MonitorFile` + rehydrated (absent ⇒
+  every-match); `create`/`update` validate (milestone needs `(?<total>…)`);
+  `ssh_monitor` gained `notify=`/`template=` params + a policy column in `list`.
+- **2d — (optional) logWatches policies.** Not started. Extend `WatchSpec` +
+  `ssh_process` schema per §6; sugar monitors are every-match until then.
 
 ---
 

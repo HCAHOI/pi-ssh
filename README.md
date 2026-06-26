@@ -163,9 +163,37 @@ ssh_monitor pause   <mon_id>     # resume / remove likewise
 ssh_monitor update  <mon_id>  pattern='NaN|inf'      # standalone monitors only
 ```
 
+### Notify policies (kill the spam)
+
+A **notify policy** controls how matches map to notifications, so a chatty
+progress line doesn't ping you per match. Pass `notify=` to `create`/`update`:
+
+```
+ssh_monitor create source=process:<id>:stdout \
+  pattern='\[(?<n>\d+)/(?<total>\d+)\] DONE'  notify=digest:30s \
+  template='progress {n}/{total} · ETA {eta}'
+ssh_monitor create source=process:<id>:both pattern='Traceback' notify=throttle:60s
+ssh_monitor create source=process:<id>:stdout pattern='step ' notify=every-n:100
+ssh_monitor update <mon_id> notify=milestone:0.25,0.5,0.75,1.0
+```
+
+- `every-match` (default) — one notification per match (legacy behavior).
+- `every-n:N` — fire once per N matches.
+- `throttle:DUR` — min gap between fires; the next fire reports how many were
+  suppressed in between (`DUR` = `90s` / `5m` / `1h` / bare ms).
+- `digest:DUR` — buffer matches and emit one rolling summary per window (flushed
+  on the scheduler tick; remainder flushed when the job ends).
+- `milestone:f1,f2,…` — fire when progress crosses each fraction; **requires a
+  `(?<total>…)` capture** (uses `(?<n>…)` if present, else the match count).
+
+**Named captures** `(?<x>…)` are exposed to an optional `template` as `{x}`,
+plus `{count}`, `{matchCount}`, `{line}`, `{total}`, `{pct}`, `{eta}` (ETA/`pct`
+need a `total` capture). A non-`every-match` policy keeps matching regardless of
+`repeat`.
+
 - **Source** is `process:<procId>[:stdout|stderr|both]` (stream defaults to
-  `both`); get `<procId>` from `ssh_process list`. (Phase 1 is process-source
-  only; `file:`/`probe:` sources land later.)
+  `both`); get `<procId>` from `ssh_process list`. (Process-source only for now;
+  `file:`/`probe:` sources + `notifyWhen` land in Phase 3.)
 - Matching **seeks to the log's current end** at create, so a monitor attached to
   an already-running job fires only on **new** lines, never historical ones.
 - **Standalone** monitors persist to `<remote-cwd>/.pi-ssh-monitors/<id>.json`

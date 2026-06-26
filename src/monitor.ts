@@ -14,6 +14,25 @@ import { shQuote } from "./utils";
 import { runRemoteCommand } from "./ssh/transport";
 import { processRoot } from "./process-queries";
 import { sendProcessMessage } from "./notify";
+import { formatDuration } from "./utils";
+import { makeNotifyGate, type GateDecision, type NotifyGate, type NotifyPolicy } from "./notify-policy";
+
+const EVERY_MATCH: NotifyPolicy = { mode: "every-match" };
+
+function policyLabel(p: NotifyPolicy): string {
+	switch (p.mode) {
+		case "every-match":
+			return "every";
+		case "every-n":
+			return `every-${p.n}`;
+		case "throttle":
+			return `throttle:${formatDuration(p.minIntervalMs)}`;
+		case "digest":
+			return `digest:${formatDuration(p.everyMs)}`;
+		case "milestone":
+			return `milestone:${p.fractions.join(",")}`;
+	}
+}
 
 const POLL_INTERVAL_MS = 3000;
 
@@ -29,6 +48,10 @@ export interface MonitorFile {
 	repeat: boolean;
 	name?: string;
 	paused: boolean;
+	/** Notification policy. Absent (legacy file) ⇒ every-match. */
+	notify?: NotifyPolicy;
+	/** Optional capture-aware notification body template. */
+	template?: string;
 }
 
 interface MonitorState {
@@ -47,10 +70,17 @@ interface MonitorState {
 	/** Per-stream byte offset into the source log(s). */
 	off: Record<string, number>;
 	paused: boolean;
-	/** One-shot (repeat=false) latch: once matched it stops matching. */
+	/** One-shot (repeat=false) latch: once matched it stops matching. Only applies
+	 * under the every-match policy; aggregating policies always keep matching. */
 	fired: boolean;
 	matchCount: number;
 	lastMatchAt: number | null;
+	/** Notification policy + the live gate that applies it (rebuilt on update). */
+	notify: NotifyPolicy;
+	template?: string;
+	gate: NotifyGate;
+	/** Named groups from the most recent match (for list display). */
+	captures: Record<string, string>;
 	busy: boolean;
 	finished: boolean;
 }
@@ -61,6 +91,7 @@ export interface MonitorRow {
 	source: string;
 	pattern: string;
 	repeat: boolean;
+	notify: string;
 	paused: boolean;
 	fired: boolean;
 	matchCount: number;
@@ -72,12 +103,16 @@ export interface CreateMonitorOpts {
 	pattern: string;
 	repeat?: boolean;
 	name?: string;
+	notify?: NotifyPolicy;
+	template?: string;
 }
 
 export interface UpdateMonitorPatch {
 	pattern?: string;
 	repeat?: boolean;
 	name?: string;
+	notify?: NotifyPolicy;
+	template?: string;
 }
 
 export interface MonitorManager {
@@ -211,23 +246,42 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 		return off;
 	}
 
+	// Only the every-match policy honors the one-shot latch; aggregating policies
+	// (every-n/throttle/digest/milestone) must keep matching to do their job.
+	function isOneShot(m: MonitorState): boolean {
+		return !m.repeat && m.notify.mode === "every-match";
+	}
+
+	// Deliver a gate decision through the sink. `stream` is known for per-line
+	// matches but not for tick/close flushes (a digest can span both streams).
+	function emitMonitor(m: MonitorState, d: GateDecision, stream?: "stdout" | "stderr"): void {
+		const label = m.name ? `"${m.name}" (${m.id})` : m.id;
+		const where = stream ? ` on ${stream}` : "";
+		emit(`🔔 ssh_monitor ${label} /${m.pattern}/${where} (process ${m.source.procId}):\n${d.text ?? ""}`, {
+			kind: "monitor",
+			monitorId: m.id,
+			procId: m.source.procId,
+			...(stream ? { stream } : {}),
+			pattern: m.pattern,
+			matchCount: m.matchCount,
+			...d.details,
+		});
+	}
+
 	function runMatch(m: MonitorState, stream: "stdout" | "stderr", lines: string[]): void {
 		for (const line of lines) {
-			if (m.fired && !m.repeat) break;
-			if (!m.re.test(line)) continue;
+			if (m.fired && isOneShot(m)) break;
+			// exec (not test) so named groups are captured for the notify policy/template.
+			// The regex is non-global (compilePattern adds no flags), so lastIndex never
+			// advances and each line is matched independently.
+			const match = m.re.exec(line);
+			if (!match) continue;
 			m.matchCount++;
 			m.lastMatchAt = Date.now();
-			const label = m.name ? `"${m.name}" (${m.id})` : m.id;
-			emit(`🔔 ssh_monitor ${label} matched /${m.pattern}/ on ${stream} (process ${m.source.procId}):\n${line}`, {
-				kind: "monitor",
-				monitorId: m.id,
-				procId: m.source.procId,
-				stream,
-				pattern: m.pattern,
-				line,
-				matchCount: m.matchCount,
-			});
-			if (!m.repeat) {
+			m.captures = { ...(match.groups ?? {}) };
+			const decision = m.gate.onMatch({ line, captures: m.captures, matchCount: m.matchCount, now: m.lastMatchAt });
+			if (decision.fire) emitMonitor(m, decision, stream);
+			if (isOneShot(m)) {
 				m.fired = true;
 				break;
 			}
@@ -246,7 +300,7 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 				await removeInternal(m);
 				return;
 			}
-			if (!(m.fired && !m.repeat)) {
+			if (!(m.fired && isOneShot(m))) {
 				for (const s of streamsOf(m.source.stream)) {
 					const file = `${m.dir}/${s}.log`;
 					const { lines, nextOff } = await fetchDelta(m.target, file, m.off[s] ?? 0);
@@ -254,12 +308,19 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 					if (lines.length) runMatch(m, s, lines);
 				}
 			}
+			const now = Date.now();
 			if (status === "done") {
 				// Process exited: the sweep above read every remaining byte, so no new
-				// lines can arrive. Stop monitoring (keep the persisted file? no — the
-				// bound process is finished, the monitor is spent).
+				// lines can arrive. Flush any pending digest, then stop (the bound process
+				// is finished, the monitor is spent).
+				const close = m.gate.onClose(now);
+				if (close.fire) emitMonitor(m, close);
 				m.finished = true;
 				await removeInternal(m);
+			} else {
+				// Still running: give time-based policies (digest) a chance to flush.
+				const tick = m.gate.onTick(now);
+				if (tick.fire) emitMonitor(m, tick);
 			}
 		} catch {
 			// Swallow: a single failed tick must never escape and kill the scheduler.
@@ -270,7 +331,7 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 
 	// --- persistence (standalone monitors only) ---
 	function toFile(m: MonitorState): MonitorFile {
-		return { id: m.id, source: m.source, pattern: m.pattern, repeat: m.repeat, name: m.name, paused: m.paused };
+		return { id: m.id, source: m.source, pattern: m.pattern, repeat: m.repeat, name: m.name, paused: m.paused, notify: m.notify, template: m.template };
 	}
 
 	async function persist(m: MonitorState): Promise<void> {
@@ -311,7 +372,10 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 		paused: boolean;
 		target: SshTarget;
 		off: Record<string, number>;
+		notify?: NotifyPolicy;
+		template?: string;
 	}): MonitorState {
+		const notify = args.notify ?? EVERY_MATCH;
 		return {
 			id: args.id,
 			kind: args.kind,
@@ -327,13 +391,26 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 			fired: false,
 			matchCount: 0,
 			lastMatchAt: null,
+			notify,
+			template: args.template,
+			gate: makeNotifyGate(notify, { template: args.template }),
+			captures: {},
 			busy: false,
 			finished: false,
 		};
 	}
 
+	// A milestone policy computes progress from a `total` capture; without it there
+	// is nothing to measure against. Validate at create/update time (fail fast).
+	function assertPolicyMatchesPattern(notify: NotifyPolicy, pattern: string): void {
+		if (notify.mode === "milestone" && !/\(\?<total>/.test(pattern)) {
+			throw new Error(`milestone policy needs a (?<total>…) named capture group in the pattern to measure progress; got /${pattern}/`);
+		}
+	}
+
 	async function create(t: SshTarget, opts: CreateMonitorOpts): Promise<MonitorState> {
 		compilePattern(opts.pattern); // fail fast before any remote round-trip
+		assertPolicyMatchesPattern(opts.notify ?? EVERY_MATCH, opts.pattern);
 		const dir = `${processRoot(t)}/${opts.source.procId}`;
 		const status = await procStatus(t, dir);
 		if (status === "gone") throw new Error(`Process ${opts.source.procId} not found (no ${dir}). Start it with ssh_process or check the id with ssh_process list.`);
@@ -342,7 +419,7 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 		// Seek to current EOF so a monitor attached to an already-running process does
 		// not re-fire on historical log lines (same rule as poller rehydrate).
 		const off = await eofOffsets(t, dir, opts.source.stream);
-		const state = buildState({ id, kind: "standalone", source: opts.source, pattern: opts.pattern, repeat: opts.repeat ?? false, name: opts.name, paused: false, target: t, off });
+		const state = buildState({ id, kind: "standalone", source: opts.source, pattern: opts.pattern, repeat: opts.repeat ?? false, name: opts.name, paused: false, target: t, off, notify: opts.notify, template: opts.template });
 		addMonitor(state);
 		await persist(state);
 		return state;
@@ -355,6 +432,8 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 			const stream = w.stream ?? "both";
 			const off: Record<string, number> = {};
 			for (const s of streamsOf(stream)) off[s] = opts?.offsets ? opts.offsets[s] : 0;
+			// Sugar (logWatches) monitors are every-match for back-compat (Phase 1
+			// behavior). Per-watch policies are a future opt-in (Phase 2d).
 			const state = buildState({ id, kind: "sugar", source: { kind: "process", procId, stream }, pattern: w.pattern, repeat: w.repeat ?? false, name: opts?.name, paused: false, target: t, off });
 			addMonitor(state);
 		});
@@ -367,6 +446,7 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 			source: sourceLabel(m.source),
 			pattern: m.pattern,
 			repeat: m.repeat,
+			notify: policyLabel(m.notify),
 			paused: m.paused,
 			fired: m.fired,
 			matchCount: m.matchCount,
@@ -383,13 +463,26 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 	async function update(id: string, patch: UpdateMonitorPatch): Promise<MonitorState> {
 		const m = getMonitor(id);
 		if (m.kind === "sugar") throw new Error(`${id} is a process-sugar monitor (from ssh_process logWatches); it cannot be edited. Create a standalone monitor with ssh_monitor create instead.`);
+		// Validate everything before mutating any field (so a bad patch leaves the
+		// monitor untouched).
+		const nextPattern = patch.pattern ?? m.pattern;
+		const nextNotify = patch.notify ?? m.notify;
+		const nextTemplate = patch.template !== undefined ? patch.template : m.template;
+		if (patch.pattern !== undefined) compilePattern(patch.pattern);
+		assertPolicyMatchesPattern(nextNotify, nextPattern);
 		if (patch.pattern !== undefined) {
-			m.re = compilePattern(patch.pattern); // throws before mutating on a bad regex
+			m.re = compilePattern(patch.pattern);
 			m.pattern = patch.pattern;
 			m.fired = false; // a changed pattern re-arms the one-shot latch
 		}
 		if (patch.repeat !== undefined) m.repeat = patch.repeat;
 		if (patch.name !== undefined) m.name = patch.name;
+		// Rebuild the gate when policy or template changes (resets policy counters).
+		if (patch.notify !== undefined || patch.template !== undefined) {
+			m.notify = nextNotify;
+			m.template = nextTemplate;
+			m.gate = makeNotifyGate(nextNotify, { template: nextTemplate });
+		}
 		await persist(m);
 		return m;
 	}
@@ -498,7 +591,7 @@ print(json.dumps({'monitors': mons, 'procs': procs}))
 				continue;
 			}
 			try {
-				const state = buildState({ id: spec.id, kind: "standalone", source: spec.source, pattern: spec.pattern, repeat: !!spec.repeat, name: spec.name, paused: !!spec.paused, target: t, off: eofFor(proc, spec.source.stream) });
+				const state = buildState({ id: spec.id, kind: "standalone", source: spec.source, pattern: spec.pattern, repeat: !!spec.repeat, name: spec.name, paused: !!spec.paused, target: t, off: eofFor(proc, spec.source.stream), notify: spec.notify, template: spec.template });
 				addMonitor(state);
 			} catch {
 				// A corrupt/invalid persisted monitor (e.g. bad regex) must not abort
