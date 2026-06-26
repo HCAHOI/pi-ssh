@@ -10,7 +10,7 @@
 import { randomBytes } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { SshTarget, WatchSpec } from "./types";
-import { shQuote } from "./utils";
+import { formatDuration, shQuote } from "./utils";
 import { runRemoteCommand } from "./ssh/transport";
 import { processRoot } from "./process-queries";
 import { sendProcessMessage } from "./notify";
@@ -41,6 +41,8 @@ export interface MonitorFile {
 	template?: string;
 	/** Optional safe predicate gating a fire (probe: required; process/file: extra filter). */
 	notifyWhen?: string;
+	/** Optional silence/stall window (ms): fire once if no match arrives within it. */
+	expectEveryMs?: number;
 }
 
 interface MonitorState {
@@ -58,8 +60,11 @@ interface MonitorState {
 	/** Safe predicate over captures/value/exitCode/matchCount/elapsedMs; gates a fire. */
 	notifyWhen?: string;
 	notifyWhenAst?: Ast;
-	/** Monitor creation epoch ms (elapsedMs anchor for notifyWhen). */
+	/** Monitor creation epoch ms (elapsedMs anchor for notifyWhen; silence anchor pre-first-match). */
 	startedAt: number;
+	/** Silence/stall window (ms): fire once if no match within it; re-armed on the next match. */
+	expectEveryMs?: number;
+	silenceFired: boolean;
 	target: SshTarget;
 	/** Per-source mutable runtime (offsets/clocks). Replaces the bare process dir/off. */
 	srt: SourceRuntime;
@@ -102,6 +107,7 @@ export interface CreateMonitorOpts {
 	notify?: NotifyPolicy;
 	template?: string;
 	notifyWhen?: string;
+	expectEveryMs?: number;
 }
 
 /** One logWatch resolved to a monitor spec (notify already parsed), bound to the
@@ -121,6 +127,8 @@ export interface UpdateMonitorPatch {
 	notify?: NotifyPolicy;
 	template?: string;
 	notifyWhen?: string;
+	/** 0 clears the silence window; positive sets it; undefined leaves it unchanged. */
+	expectEveryMs?: number;
 }
 
 export interface MonitorManager {
@@ -171,6 +179,14 @@ export function assertPolicyMatchesPattern(notify: NotifyPolicy, pattern: string
 	if (notify.mode === "milestone" && !/\(\?<total>/.test(pattern)) {
 		throw new Error(`milestone policy needs a (?<total>…) named capture group in the pattern to measure progress; got /${pattern}/`);
 	}
+}
+
+// Pure silence/stall predicate (extracted for unit testing): a monitor is "silent"
+// when a window is set, it has not already fired for this gap, and the time since
+// the last match (or creation, before the first match) exceeds the window.
+export function silenceDue(s: { expectEveryMs?: number; silenceFired: boolean; lastMatchAt: number | null; startedAt: number }, now: number): boolean {
+	if (!s.expectEveryMs || s.silenceFired) return false;
+	return now - (s.lastMatchAt ?? s.startedAt) > s.expectEveryMs;
 }
 
 export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
@@ -243,6 +259,27 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 		}
 	}
 
+	// Silence/stall: no match arrived within expectEveryMs. Fires once (latched by
+	// silenceFired), re-armed when the next match resets silenceFired. Orthogonal to
+	// source kind; anchored to the last match, or to creation before the first match.
+	function emitSilence(m: MonitorState, now: number): void {
+		const since = m.lastMatchAt ?? m.startedAt;
+		const quietMs = now - since;
+		const label = m.name ? `"${m.name}" (${m.id})` : m.id;
+		const src = m.source;
+		const srcDesc = src.kind === "process" ? `process ${src.procId}` : src.kind === "file" ? `file ${src.path}` : `probe ${src.command}`;
+		emit(`🔕 ssh_monitor ${label} SILENCE (${srcDesc}): no match for ${formatDuration(quietMs)} (expected within ${formatDuration(m.expectEveryMs ?? 0)}). Possible stall/hang.`, {
+			kind: "silence",
+			monitorId: m.id,
+			source: sourceLabel(src),
+			...(src.kind === "process" ? { procId: src.procId } : {}),
+			pattern: m.pattern,
+			matchCount: m.matchCount,
+			quietMs,
+			expectEveryMs: m.expectEveryMs,
+		});
+	}
+
 	function runMatch(m: MonitorState, stream: "stdout" | "stderr" | undefined, line: string): void {
 		if (m.fired && isOneShot(m)) return;
 		// exec (not test) so named groups are captured for the notify policy/template.
@@ -255,6 +292,7 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 		if (!passesNotifyWhen(m, captures, { matchCount: m.matchCount + 1, elapsedMs: Date.now() - m.startedAt })) return;
 		m.matchCount++;
 		m.lastMatchAt = Date.now();
+		m.silenceFired = false; // a fresh match re-arms silence/stall detection
 		m.captures = captures;
 		const decision = m.gate.onMatch({ line, captures: m.captures, matchCount: m.matchCount, now: m.lastMatchAt });
 		if (decision.fire) emitMonitor(m, decision, stream, line);
@@ -279,6 +317,7 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 		m.srt.hits = 0; // re-arm the debounce so it needs another N trues to fire again
 		m.matchCount++;
 		m.lastMatchAt = now;
+		m.silenceFired = false; // a fresh probe match re-arms silence/stall detection
 		m.captures = { value: String(value), exitCode: String(probe.exitCode) };
 		const line = `${probe.stdout} (exit ${probe.exitCode})`;
 		const decision = m.gate.onMatch({ line, captures: m.captures, matchCount: m.matchCount, now });
@@ -310,12 +349,22 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 			const now = Date.now();
 			if (result.ended) {
 				// Source finished: the poll above read every remaining byte, so no new lines
-				// can arrive. Flush any pending digest, then stop (the monitor is spent).
+				// can arrive. Flush any pending digest, then stop (the monitor is spent). A
+				// clean end is not a stall, so no silence fires here.
 				const close = m.gate.onClose(now);
 				if (close.fire) emitMonitor(m, close);
 				m.finished = true;
 				await removeInternal(m);
 			} else {
+				// Silence/stall: fire once if no match within the expected window (re-armed
+				// on the next match). Before the first match the window is measured from
+				// creation, so an up-front hang is caught too. Skipped for a latched
+				// one-shot (readDeltas=false): it has done its job and never re-arms, so a
+				// post-match "silence" would be noise, not a stall.
+				if (readDeltas && silenceDue(m, now)) {
+					m.silenceFired = true;
+					emitSilence(m, now);
+				}
 				// Still live: give time-based policies (digest) a chance to flush.
 				const tick = m.gate.onTick(now);
 				if (tick.fire) emitMonitor(m, tick);
@@ -329,7 +378,7 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 
 	// --- persistence (standalone monitors only) ---
 	function toFile(m: MonitorState): MonitorFile {
-		return { id: m.id, source: m.source, pattern: m.pattern, repeat: m.repeat, name: m.name, paused: m.paused, notify: m.notify, template: m.template, notifyWhen: m.notifyWhen };
+		return { id: m.id, source: m.source, pattern: m.pattern, repeat: m.repeat, name: m.name, paused: m.paused, notify: m.notify, template: m.template, notifyWhen: m.notifyWhen, expectEveryMs: m.expectEveryMs };
 	}
 
 	async function persist(m: MonitorState): Promise<void> {
@@ -373,6 +422,7 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 		notify?: NotifyPolicy;
 		template?: string;
 		notifyWhen?: string;
+		expectEveryMs?: number;
 	}): MonitorState {
 		const notify = args.notify ?? EVERY_MATCH;
 		const pattern = args.pattern ?? "";
@@ -389,6 +439,8 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 			// drop the file at rehydrate via the surrounding try/catch).
 			notifyWhenAst: args.notifyWhen ? parseExpr(args.notifyWhen) : undefined,
 			startedAt: Date.now(),
+			expectEveryMs: args.expectEveryMs,
+			silenceFired: false,
 			target: args.target,
 			srt: args.srt,
 			paused: args.paused,
@@ -415,13 +467,14 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 			assertPolicyMatchesPattern(opts.notify ?? EVERY_MATCH, opts.pattern);
 		}
 		if (opts.notifyWhen?.trim()) parseExpr(opts.notifyWhen); // validate the predicate up front
+		if (opts.expectEveryMs !== undefined && (!Number.isFinite(opts.expectEveryMs) || opts.expectEveryMs <= 0)) throw new Error(`expectEveryMs must be a positive number of ms, got ${opts.expectEveryMs}.`);
 		const driver = DRIVERS[opts.source.kind];
 		await driver.validate(t, opts.source);
 		const id = `mon_${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
 		// Seek to current EOF so a monitor attached to an already-running source does
 		// not re-fire on historical log lines (same rule as poller rehydrate).
 		const srt = await driver.initRuntime(t, opts.source);
-		const state = buildState({ id, kind: "standalone", source: opts.source, pattern: opts.pattern, repeat: opts.repeat ?? false, name: opts.name, paused: false, target: t, srt, notify: opts.notify, template: opts.template, notifyWhen: opts.notifyWhen?.trim() || undefined });
+		const state = buildState({ id, kind: "standalone", source: opts.source, pattern: opts.pattern, repeat: opts.repeat ?? false, name: opts.name, paused: false, target: t, srt, notify: opts.notify, template: opts.template, notifyWhen: opts.notifyWhen?.trim() || undefined, expectEveryMs: opts.expectEveryMs });
 		addMonitor(state);
 		await persist(state);
 		return state;
@@ -502,6 +555,7 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 		// A probe is predicate-only: clearing its notifyWhen would make every sample fire
 		// (passesNotifyWhen returns true with no AST), violating the create-time invariant.
 		if (m.source.kind === "probe" && !nextNotifyWhen) throw new Error("probe source requires notifyWhen; it cannot be cleared. Pass a new predicate or remove the monitor.");
+		if (patch.expectEveryMs !== undefined && (patch.expectEveryMs < 0 || !Number.isFinite(patch.expectEveryMs))) throw new Error(`expectEveryMs must be >= 0 (0 clears it), got ${patch.expectEveryMs}.`);
 		if (patch.pattern !== undefined) {
 			m.re = compilePattern(patch.pattern);
 			m.pattern = patch.pattern;
@@ -511,6 +565,10 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 			m.notifyWhen = nextNotifyWhen;
 			m.notifyWhenAst = nextNotifyWhenAst;
 			m.fired = false; // a changed predicate re-arms the one-shot latch
+		}
+		if (patch.expectEveryMs !== undefined) {
+			m.expectEveryMs = patch.expectEveryMs > 0 ? patch.expectEveryMs : undefined;
+			m.silenceFired = false; // a changed window re-arms silence/stall detection
 		}
 		if (patch.repeat !== undefined) m.repeat = patch.repeat;
 		if (patch.name !== undefined) m.name = patch.name;
@@ -638,7 +696,7 @@ print(json.dumps({'monitors': mons, 'procs': procs}))
 				} else {
 					srt = await DRIVERS[source.kind].rehydrateRuntime(t, source);
 				}
-				const state = buildState({ id: spec.id, kind: "standalone", source, pattern: spec.pattern, repeat: !!spec.repeat, name: spec.name, paused: !!spec.paused, target: t, srt, notify: spec.notify, template: spec.template, notifyWhen: spec.notifyWhen });
+				const state = buildState({ id: spec.id, kind: "standalone", source, pattern: spec.pattern, repeat: !!spec.repeat, name: spec.name, paused: !!spec.paused, target: t, srt, notify: spec.notify, template: spec.template, notifyWhen: spec.notifyWhen, expectEveryMs: spec.expectEveryMs });
 				addMonitor(state);
 			} catch {
 				// A corrupt/invalid persisted monitor (e.g. bad regex) must not abort
