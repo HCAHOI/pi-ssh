@@ -232,7 +232,11 @@ Priority by value/effort:
   persisted in the job's `notify.json`); standalone monitors persist to
   `.pi-ssh-monitors/<id>.json`. Both rehydrate on (re)connect, seeking each source
   to EOF. See §9 decisions + accepted trade-offs below.
-- **Phase 2 — Notify policy + captures (roadmap 1).** Spam fix ships.
+- **Phase 2 — Notify policy + captures (roadmap 1).** Spam fix ships. ← NEXT.
+  Detailed implementation plan: **`MONITOR_PHASE2_PLAN.md`** (pure tick-driven
+  `NotifyGate` between `runMatch`'s `re.exec` and `emit`; `every-match | every-n |
+  throttle | digest | milestone` + capture-aware template; `notifyWhen` deferred
+  to Phase 3; ships the project's first unit tests).
 - **Phase 3 — `file:`/`probe:` sources + silence (roadmap 3,4).**
 - **Phase 4 — digest/ETA, routing (roadmap 5,6).**
 
