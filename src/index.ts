@@ -77,6 +77,7 @@ import type {
 	WatchState,
 } from "./types";
 import {
+	buildEnvExports,
 	formatDuration,
 	grepArgs,
 	shQuote,
@@ -114,9 +115,18 @@ import {
 	sshFailureMessage,
 } from "./ssh/transport";
 import { resolveTarget, sshExecRaw } from "./ssh/target";
+import { sendProcessMessage } from "./notify";
+import { buildWatchStates, createPollerManager, type NotifyConfig } from "./poller";
+import {
+	buildClearCommand,
+	buildKillCommand,
+	formatProcRows,
+	listProcesses,
+	processRoot,
+	processRunScript,
+	type ProcRow,
+} from "./process-queries";
 
-// ssh_process poller tick interval (poller subsystem extracted in a later phase).
-const POLL_INTERVAL_MS = 3000;
 
 // ---------------------------------------------------------------------------
 // Extension
@@ -136,6 +146,11 @@ export default function (pi: ExtensionAPI) {
 	const localGrep = createGrepTool(localCwd);
 	const localLs = createLsTool(localCwd);
 	const localBash = createBashTool(localCwd);
+
+	// Background ssh_process notification poller (owns pollers + latestStartByName).
+	const poller = createPollerManager(pi);
+	// Agent-facing notification sink shared by the poller and the sync watcher.
+	const emit = (content: string, details: Record<string, unknown>): void => sendProcessMessage(pi, content, details);
 
 	let target: SshTarget | null = null;
 	const get = () => target;
@@ -352,19 +367,19 @@ export default function (pi: ExtensionAPI) {
 		// in-memory pollers and just repoint them at the new connection, so a reconnect
 		// never silently drops a still-pending completion / log-watch notification.
 		if (prev && prev.remote === next.remote && prev.remoteCwd === next.remoteCwd) {
-			for (const p of pollers.values()) p.target = next;
+			poller.repointAll(next);
 		} else {
-			stopAllPollers();
+			poller.stopAll();
 		}
 		if (prev) await closeMaster(prev);
 		target = next;
 		stopAllTunnels();
-		await rehydratePollers(next);
+		await poller.rehydrate(next);
 		return next;
 	}
 
 	async function disconnect(): Promise<void> {
-		stopAllPollers();
+		poller.stopAll();
 		stopSyncWatcher();
 		if (target) {
 			stopAllTunnels();
@@ -373,286 +388,6 @@ export default function (pi: ExtensionAPI) {
 		target = null;
 	}
 
-	// --- ssh_process background notification poller (Phase 1) ---
-	const pollers = new Map<string, PollerState>();
-	// Most-recent start per job name. Lets a late completion notification flag that a
-	// newer run of the same name was started after it, so the agent can tell stale
-	// (superseded) alerts from current ones in parallel multi-run workflows. Survives
-	// the finished poller's removal from `pollers`.
-	const latestStartByName = new Map<string, string>();
-
-	function stopPoller(procId: string): void {
-		const p = pollers.get(procId);
-		if (!p) return;
-		if (p.timer) clearInterval(p.timer);
-		p.timer = null;
-		pollers.delete(procId);
-	}
-
-	function stopAllPollers(): void {
-		for (const id of [...pollers.keys()]) stopPoller(id);
-	}
-
-	function statusCmd(dir: string): string {
-		return `d=${shQuote(dir)}; if [ ! -d "$d" ]; then printf 'gone\\t\\n'; else pid=$(cat "$d/pid" 2>/dev/null || true); if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then printf 'running\\t\\n'; else code=$(cat "$d/exit_code" 2>/dev/null || true); printf 'done\\t%s\\n' "$code"; fi; fi`;
-	}
-
-	function neededStreams(p: PollerState): Array<"stdout" | "stderr"> {
-		const set = new Set<"stdout" | "stderr">();
-		for (const w of p.watches) {
-			if (w.stream === "stdout" || w.stream === "both") set.add("stdout");
-			if (w.stream === "stderr" || w.stream === "both") set.add("stderr");
-		}
-		return [...set];
-	}
-
-	// Read new complete lines appended to a log since the last byte offset. We only
-	// advance the offset to the last newline, so partial lines (and multibyte chars
-	// straddling the boundary) are re-read intact next tick. Survives Mac sleep:
-	// offsets are byte positions in the remote file, so nothing logged while asleep
-	// is lost — it is swept on the first tick after wake.
-	async function fetchDeltaLines(p: PollerState, stream: "stdout" | "stderr"): Promise<string[]> {
-		const file = `${p.dir}/${stream}.log`;
-		const start = p.off[stream];
-		const r = await runRemoteCommand(p.target, `tail -c +${start + 1} -- ${shQuote(file)} 2>/dev/null || true`, { timeout: 20, login: false });
-		if (r.code !== 0) return [];
-		const buf = r.stdout;
-		if (buf.length === 0) return [];
-		const lastNl = buf.lastIndexOf(0x0a);
-		if (lastNl === -1) return []; // no complete line yet
-		p.off[stream] = start + lastNl + 1;
-		return buf.subarray(0, lastNl).toString("utf8").split("\n");
-	}
-
-	function emit(content: string, details: Record<string, unknown>): void {
-		pi.sendMessage(
-			{ customType: "ssh-process", content, display: true, details },
-			{ triggerTurn: true, deliverAs: "followUp" },
-		);
-	}
-
-	function runWatches(p: PollerState, stream: "stdout" | "stderr", lines: string[]): void {
-		for (const w of p.watches) {
-			if (w.fired && !w.repeat) continue;
-			if (w.stream !== "both" && w.stream !== stream) continue;
-			for (const line of lines) {
-				if (!w.re.test(line)) continue;
-				emit(`🔔 ssh_process "${p.name}" (${p.procId}) matched /${w.pattern}/ on ${stream}:\n${line}`, {
-					kind: "watch",
-					procId: p.procId,
-					name: p.name,
-					pattern: w.pattern,
-					stream,
-					line,
-				});
-				if (!w.repeat) {
-					w.fired = true;
-					break;
-				}
-			}
-		}
-	}
-
-	async function sweepWatches(p: PollerState): Promise<void> {
-		for (const stream of neededStreams(p)) {
-			const lines = await fetchDeltaLines(p, stream);
-			if (lines.length) runWatches(p, stream, lines);
-		}
-	}
-
-	async function fireCompletion(p: PollerState, codeStr: string): Promise<void> {
-		const code = codeStr === "" ? null : Number.parseInt(codeStr, 10);
-		let outcome: "success" | "failure" | "killed";
-		if (code === 0) outcome = "success";
-		else if (code === null) outcome = "killed"; // exit_code absent => SIGKILL (EXIT trap never ran)
-		else if (code >= 128) outcome = "killed"; // 128 + signal
-		else outcome = "failure";
-		// Mark completion handled so a later reconnect/rehydrate never re-notifies for
-		// this job, regardless of whether this particular alert was opted into.
-		await runRemoteCommand(p.target, `touch -- ${shQuote(`${p.dir}/notified`)}`, { timeout: 20, login: false }).catch(() => {});
-		const want = outcome === "success" ? p.alertOnSuccess : outcome === "killed" ? p.alertOnKill : p.alertOnFailure;
-		if (!want) return;
-		const tailCmd = `d=${shQuote(p.dir)}; echo '--- stdout (tail) ---'; tail -n 15 "$d/stdout.log" 2>/dev/null; echo '--- stderr (tail) ---'; tail -n 15 "$d/stderr.log" 2>/dev/null`;
-		const tr = await runRemoteCommand(p.target, tailCmd, { timeout: 20, login: false }).catch(() => null);
-		const tail = tr && tr.code === 0 ? tr.stdout.toString().trimEnd() : "";
-		const emoji = outcome === "success" ? "✅" : outcome === "killed" ? "⛔" : "❌";
-		const codeLabel = code === null ? "" : ` (exit ${code})`;
-		const latest = latestStartByName.get(p.name);
-		const superseded = latest !== undefined && latest !== p.procId;
-		const supersedeLabel = superseded ? " [superseded: a newer run of this name was started after it]" : "";
-		const ageLabel = p.startedAt ? ` after ${formatDuration(Date.now() - p.startedAt)}` : "";
-		emit(`${emoji} ssh_process "${p.name}" (${p.procId})${supersedeLabel} ${outcome}${codeLabel}${ageLabel}.${tail ? `\n${tail}` : ""}`, {
-			kind: "completion",
-			procId: p.procId,
-			name: p.name,
-			outcome,
-			code,
-			superseded,
-		});
-	}
-
-	async function tick(p: PollerState): Promise<void> {
-		if (p.busy || p.finished) return;
-		p.busy = true;
-		try {
-			const r = await runRemoteCommand(p.target, statusCmd(p.dir), { timeout: 20, login: false });
-			if (r.code !== 0) return; // transient (e.g. stale socket post-wake); retry next tick
-			// login:false avoids profile banners, but defensively take the last
-			// non-empty line rather than the first.
-			const out = r.stdout.toString().trim();
-			if (!out) return;
-			const [status, code = ""] = out.split("\n").pop()!.split("\t");
-			if (status === "gone") {
-				// dir removed (e.g. ssh_process clear / manual rm): orphaned poller,
-				// stop silently without a spurious completion notification.
-				p.finished = true;
-				stopPoller(p.procId);
-				return;
-			}
-			if (p.watches.length) await sweepWatches(p);
-			if (status === "running") return;
-			if (p.watches.length) await sweepWatches(p); // final sweep before we stop
-			p.finished = true;
-			await fireCompletion(p, code);
-			stopPoller(p.procId);
-		} catch {
-			// Swallow: a single failed tick must never escape setInterval and kill the
-			// poller. The next tick retries (critical for Mac sleep/wake recovery).
-		} finally {
-			p.busy = false;
-		}
-	}
-
-	function startPoller(args: {
-		procId: string;
-		name: string;
-		dir: string;
-		target: SshTarget;
-		alertOnSuccess: boolean;
-		alertOnFailure: boolean;
-		alertOnKill: boolean;
-		watches: WatchState[];
-		/** Initial byte offsets. Fresh start: {0,0} (watch from the top). Rehydrate on
-		 * reconnect/restart: seek to current EOF so historical log lines are not
-		 * re-matched (only completion + new lines fire). */
-		offsets?: { stdout: number; stderr: number };
-		/** Epoch ms of the fresh start (for run-duration reporting); omit for rehydrate. */
-		startedAt?: number;
-	}): void {
-		if (!args.alertOnSuccess && !args.alertOnFailure && !args.alertOnKill && args.watches.length === 0) return;
-		if (pollers.has(args.procId)) return; // already tracked
-		const state: PollerState = {
-			...args,
-			off: args.offsets ?? { stdout: 0, stderr: 0 },
-			timer: null,
-			busy: false,
-			finished: false,
-		};
-		pollers.set(state.procId, state);
-		state.timer = setInterval(() => {
-			void tick(state);
-		}, POLL_INTERVAL_MS);
-		state.timer.unref?.();
-	}
-
-	function buildWatchStates(specs: WatchSpec[] | undefined): WatchState[] {
-		return (specs ?? []).map((w) => {
-			let re: RegExp;
-			try {
-				re = new RegExp(w.pattern);
-			} catch (e) {
-				throw new Error(`Invalid logWatches pattern /${w.pattern}/: ${e instanceof Error ? e.message : String(e)}`);
-			}
-			return { re, pattern: w.pattern, stream: w.stream ?? "both", repeat: w.repeat ?? false, fired: false };
-		});
-	}
-
-	interface NotifyConfig {
-		name?: string;
-		alertOnSuccess?: boolean;
-		alertOnFailure?: boolean;
-		alertOnKill?: boolean;
-		watches?: WatchSpec[];
-	}
-
-	// Re-arm pollers from each job's persisted notify.json after a (re)connect, so
-	// completion / log-watch notifications survive reconnect, ssh_connect switching,
-	// and full pi restarts. Jobs already tracked or already notified are skipped;
-	// offsets seek to EOF so historical watch lines do not re-fire. A finished,
-	// un-notified job fires its missed completion on the first tick.
-	async function rehydratePollers(t: SshTarget): Promise<void> {
-		if (!t.hasPython) return;
-		const root = processRoot(t);
-		const script = `
-import base64, json, os, sys
-root = sys.argv[1]
-out = []
-if os.path.isdir(root):
-    for d in sorted(os.listdir(root)):
-        p = os.path.join(root, d)
-        nf = os.path.join(p, 'notify.json')
-        if not (os.path.isdir(p) and os.path.isfile(nf)):
-            continue
-        try:
-            notify = open(nf).read()
-        except OSError:
-            continue
-        pid = ''
-        try:
-            pid = open(os.path.join(p, 'pid')).read().strip()
-        except OSError:
-            pass
-        running = False
-        if pid:
-            try:
-                os.kill(int(pid), 0)
-                running = True
-            except (OSError, ValueError):
-                running = False
-        def sz(f):
-            try:
-                return os.path.getsize(os.path.join(p, f))
-            except OSError:
-                return 0
-        out.append({
-            'id': d,
-            'notify': base64.b64encode(notify.encode()).decode(),
-            'running': running,
-            'notified': os.path.isfile(os.path.join(p, 'notified')),
-            'outSize': sz('stdout.log'),
-            'errSize': sz('stderr.log'),
-        })
-print(json.dumps(out))
-`;
-		let entries: Array<{ id: string; notify: string; running: boolean; notified: boolean; outSize: number; errSize: number }>;
-		try {
-			const r = await runRemoteCommand(t, `python3 -c ${shQuote(script)} ${shQuote(root)}`, { timeout: 20, login: false });
-			if (r.code !== 0) return;
-			entries = JSON.parse(r.stdout.toString() || "[]");
-		} catch {
-			return;
-		}
-		for (const e of entries) {
-			if (pollers.has(e.id) || e.notified) continue;
-			let cfg: NotifyConfig;
-			try {
-				cfg = JSON.parse(Buffer.from(e.notify, "base64").toString());
-			} catch {
-				continue;
-			}
-			startPoller({
-				procId: e.id,
-				name: cfg.name?.trim() || e.id,
-				dir: `${root}/${e.id}`,
-				target: t,
-				alertOnSuccess: cfg.alertOnSuccess ?? false,
-				alertOnFailure: cfg.alertOnFailure ?? true,
-				alertOnKill: cfg.alertOnKill ?? false,
-				watches: buildWatchStates(cfg.watches),
-				offsets: { stdout: e.outSize, stderr: e.errSize },
-			});
-		}
-	}
 
 	function requireTarget(): SshTarget {
 		if (!target) {
@@ -666,16 +401,6 @@ print(json.dumps(out))
 		if (t.defaultCommandPrefix) lines.push(`  activation (every ssh_bash/ssh_process): ${t.defaultCommandPrefix}`);
 		if (t.defaultEnv && Object.keys(t.defaultEnv).length) lines.push(`  env: ${Object.keys(t.defaultEnv).join(", ")}`);
 		return lines.join("\n");
-	}
-
-	function buildEnvExports(env: Record<string, string> | undefined): string[] {
-		if (!env) return [];
-		return Object.entries(env).map(([key, value]) => {
-			if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
-				throw new Error(`Invalid environment variable name for ssh_bash: ${key}`);
-			}
-			return `export ${key}=${shQuote(value)}`;
-		});
 	}
 
 	function buildSshBashCommand(t: SshTarget, params: {
@@ -1109,99 +834,6 @@ print(json.dumps(out))
 		},
 	});
 
-	function processRoot(t: SshTarget): string {
-		return `${t.remoteCwd}/.pi-ssh-processes`;
-	}
-
-	// --- shared process queries (used by ssh_process AND the /ssh dashboard) ---
-	interface ProcRow {
-		id: string;
-		name: string;
-		status: "running" | "exited";
-		code: number | null;
-		pid: string;
-		/** Epoch ms decoded from the id prefix (base36 Date.now() at start), or null. */
-		startedMs: number | null;
-	}
-
-	// Single source of truth for the process listing. The structured parse below and
-	// the ssh_process `list` text output both derive from this one command.
-	function buildProcessListCommand(root: string): string {
-		return `root=${shQuote(root)}; if [ ! -d "$root" ]; then echo 'No remote processes.'; exit 0; fi; found=0; for d in "$root"/*; do [ -d "$d" ] || continue; found=1; id=$(basename "$d"); pid=$(cat "$d/pid" 2>/dev/null || true); name=$(cat "$d/name" 2>/dev/null || true); if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then status=running; code='-'; else status=exited; code=$(cat "$d/exit_code" 2>/dev/null || true); [ -n "$code" ] || code='?'; fi; printf '%s\t%s\texit=%s\tpid=%s\t%s\n' "$id" "$status" "$code" "$pid" "$name"; done; [ "$found" -eq 0 ] && echo 'No remote processes.' || true`;
-	}
-
-	function parseProcRows(text: string): ProcRow[] {
-		const rows: ProcRow[] = [];
-		for (const line of text.split("\n")) {
-			if (!line.trim() || line.trim() === "No remote processes.") continue;
-			const parts = line.split("\t");
-			if (parts.length < 5) continue;
-			const [id, statusRaw, exitField, pidField] = parts;
-			const name = parts.slice(4).join("\t");
-			const status = statusRaw === "running" ? "running" : "exited";
-			const codeStr = exitField.startsWith("exit=") ? exitField.slice(5) : "";
-			const code = status === "running" || codeStr === "?" || codeStr === "-" || codeStr === "" ? null : Number.parseInt(codeStr, 10);
-			const pid = pidField.startsWith("pid=") ? pidField.slice(4) : pidField;
-			const base = id.split("-")[0];
-			const ms = Number.parseInt(base, 36);
-			rows.push({ id, name, status, code: Number.isNaN(code as number) ? null : code, pid, startedMs: Number.isNaN(ms) ? null : ms });
-		}
-		return rows;
-	}
-
-	// Reproduce the exact ssh_process `list` text from structured rows, byte-identical
-	// to the legacy inline command output (so the agent-facing tool is unchanged).
-	function formatProcRows(rows: ProcRow[]): string {
-		return rows
-			.map((r) => {
-				const code = r.status === "running" ? "-" : r.code === null ? "?" : String(r.code);
-				return `${r.id}\t${r.status}\texit=${code}\tpid=${r.pid}\t${r.name}`;
-			})
-			.join("\n");
-	}
-
-	async function listProcesses(t: SshTarget, signal?: AbortSignal): Promise<ProcRow[]> {
-		const r = await runRemoteCommand(t, buildProcessListCommand(processRoot(t)), { signal });
-		if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
-		return parseProcRows(r.stdout.toString());
-	}
-
-	function buildKillCommand(dir: string): string {
-		return `d=${shQuote(dir)}; test -d "$d" || { echo 'process not found' >&2; exit 2; }; pid=$(cat "$d/pid" 2>/dev/null || true); test -n "$pid" || { echo 'pid not found' >&2; exit 2; }; kill "$pid" 2>/dev/null || true; sleep 1; kill -9 "$pid" 2>/dev/null || true; printf 'killed %s\n' "$pid"`;
-	}
-
-	function buildClearCommand(root: string): string {
-		return `root=${shQuote(root)}; if [ ! -d "$root" ]; then echo 'No remote processes.'; exit 0; fi; removed=0; kept=0; for d in "$root"/*; do [ -d "$d" ] || continue; pid=$(cat "$d/pid" 2>/dev/null || true); if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then kept=$((kept+1)); continue; fi; rm -rf "$d" && removed=$((removed+1)); done; rmdir "$root" 2>/dev/null || true; printf 'Cleared %s finished process(es); %s still running.\n' "$removed" "$kept"`;
-	}
-
-	function processRunScript(t: SshTarget, params: {
-		command: string;
-		cwd?: string;
-		env?: Record<string, string>;
-		commandPrefix?: string;
-	}): string {
-		const cwd = params.cwd?.trim() ? toRemotePath(params.cwd, localCwd, t.remoteCwd) : t.remoteCwd;
-		const lines = [
-			"#!/usr/bin/env bash",
-			// Resolve the process dir (where run.sh lives) so we can record the exit code there.
-			`__pi_dir="$(cd "$(dirname "\${BASH_SOURCE[0]}")" && pwd)"`,
-			// Record the final exit status on ANY exit (normal end, explicit `exit N`,
-			// or error under set -e). A trailing capture line would be skipped whenever
-			// the command itself calls exit, so an EXIT trap is the robust choice.
-			`trap '__pi_rc=$?; printf %s "$__pi_rc" > "$__pi_dir/exit_code"' EXIT`,
-			// Record our own pid authoritatively. The launcher seeds pid with `echo $!`,
-			// but that is the `setsid` pid which on some systems is a short-lived parent;
-			// $$ here is the real job pid that list/output/kill rely on. Atomic mv avoids
-			// a torn read against the launcher's seed write.
-			`printf %s "$$" > "$__pi_dir/pid.tmp" && mv -f "$__pi_dir/pid.tmp" "$__pi_dir/pid"`,
-			`cd -- ${shQuote(cwd)}`,
-		];
-		lines.push(...buildEnvExports({ ...t.defaultEnv, ...params.env }));
-		if (t.defaultCommandPrefix?.trim()) lines.push(t.defaultCommandPrefix);
-		if (params.commandPrefix?.trim()) lines.push(params.commandPrefix);
-		lines.push(params.command);
-		return `${lines.join("\n")}\n`;
-	}
 
 	async function runLocalProcess(command: string, args: string[], signal?: AbortSignal, onData?: (chunk: Buffer) => void): Promise<{ code: number | null; stdout: Buffer; stderr: Buffer }> {
 		return new Promise((resolve, reject) => {
@@ -1375,7 +1007,7 @@ print(json.dumps(out))
 				const procId = `${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
 				const dir = `${root}/${procId}`;
 				const name = params.name?.trim() || procId;
-				const script = processRunScript(t, { command: params.command, cwd: params.cwd, env: params.env, commandPrefix: params.commandPrefix });
+				const script = processRunScript(t, { command: params.command, cwd: params.cwd, env: params.env, commandPrefix: params.commandPrefix }, localCwd);
 				// Persist the notification config so pollers can be re-armed after a
 				// reconnect / pi restart (rehydratePollers reads this).
 				const notifyJson = JSON.stringify({
@@ -1403,8 +1035,8 @@ print(json.dumps(out))
 				const watches: WatchState[] = buildWatchStates(params.logWatches);
 				// Record this as the most recent run of `name` so an older run's late
 				// completion alert can be flagged as superseded.
-				latestStartByName.set(name, procId);
-				startPoller({
+				poller.markLatestStart(name, procId);
+				poller.startPoller({
 					procId,
 					name,
 					dir,
@@ -1441,7 +1073,7 @@ print(json.dumps(out))
 			const dir = `${root}/${params.id}`;
 
 			if (params.action === "attach") {
-				if (pollers.has(params.id)) {
+				if (poller.has(params.id)) {
 					return { content: [{ type: "text" as const, text: `Already watching ${params.id}.` }] };
 				}
 				const probe = `d=${shQuote(dir)}; if [ ! -d "$d" ]; then echo 'process not found' >&2; exit 2; fi; o=$(wc -c < "$d/stdout.log" 2>/dev/null || echo 0); e=$(wc -c < "$d/stderr.log" 2>/dev/null || echo 0); n=$(base64 < "$d/notify.json" 2>/dev/null | tr -d '\n'); printf '%s\t%s\t%s\n' "$o" "$e" "$n"`;
@@ -1463,7 +1095,7 @@ print(json.dumps(out))
 				// re-fires its completion exactly once for this explicit attach.
 				const persist = `d=${shQuote(dir)}; printf %s ${shQuote(JSON.stringify(cfg))} > "$d/notify.json"; rm -f "$d/notified"`;
 				await runRemoteCommand(t, persist, { signal, login: false }).catch(() => {});
-				startPoller({
+				poller.startPoller({
 					procId: params.id,
 					name: cfg.name,
 					dir,
@@ -1507,7 +1139,7 @@ print(json.dumps(out))
 
 			// Agent-initiated kill: drop the poller first so it does not fire a
 			// spurious completion/kill notification for an expected teardown.
-			stopPoller(params.id);
+			poller.stopPoller(params.id);
 			const r = await runRemoteCommand(t, buildKillCommand(dir), { signal });
 			if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
 			return { content: [{ type: "text" as const, text: r.stdout.toString().trim() }] };
@@ -2099,7 +1731,7 @@ print(json.dumps(out))
 			const t = target;
 			const r = this.rows[this.sel];
 			if (!t || !r) return;
-			stopPoller(r.id);
+			poller.stopPoller(r.id);
 			try {
 				await runRemoteCommand(t, buildKillCommand(`${processRoot(t)}/${r.id}`));
 			} catch (e) {

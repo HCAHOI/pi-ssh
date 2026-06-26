@@ -84,3 +84,13 @@ export function toRemotePath(path: string, localCwd: string, remoteCwd: string):
 export function grepArgs(args: string[]): string {
 	return args.map(shQuote).join(" ");
 }
+
+export function buildEnvExports(env: Record<string, string> | undefined): string[] {
+	if (!env) return [];
+	return Object.entries(env).map(([key, value]) => {
+		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+			throw new Error(`Invalid environment variable name for ssh_bash: ${key}`);
+		}
+		return `export ${key}=${shQuote(value)}`;
+	});
+}
