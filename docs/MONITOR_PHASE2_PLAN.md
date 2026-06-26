@@ -1,7 +1,7 @@
 # Phase 2: Notify Policy + Captures (kill the notification spam)
 
-> Status: 2a ✅ + 2b/2c ✅ implemented (pending live smoke after a pi restart);
-> 2d (logWatches policies) optional/not started. Builds on Phase 1
+> Status: 2a ✅ + 2b/2c ✅ + 2d ✅ implemented (pending live smoke after a pi
+> restart). logWatches are now first-class monitors. Builds on Phase 1
 > (`src/monitor.ts`). Scope: this repo (`pi-ssh`). Remote-only.
 > North star: a monitor maps *matches* to *notifications* under a configurable
 > **NotifyPolicy**, using **named captures**, so `[1/50] DONE … [50/50] DONE`
@@ -189,15 +189,20 @@ the tool description + `promptGuidelines` to mention policies as the spam fix.
 
 ---
 
-## 6. logWatches sugar (optional sub-phase, back-compat)
+## 6. logWatches as first-class monitors (2d — shipped)
 
-To let `ssh_process start --logWatches` also escape spam, extend `WatchSpec`
-(`src/types.ts`) with optional `notify?: NotifyPolicy` and `template?: string`,
-thread them through `armSugarWatches` → `buildState`, and add the fields to the
-`ssh_process` `logWatches` TypeBox schema. Absent ⇒ every-match (unchanged).
-Process-sugar monitors persist in `notify.json` (already carries `watches`), so
-no new store work. **Gate Phase 2 on the standalone path first** (sub-phase 2a/b);
-ship logWatches policies as 2d only if cheap.
+Rather than a second-class "sugar" tier, `ssh_process start --logWatches` now
+desugars each watch into a **standalone monitor** (`monitors.createForProcess`):
+random `mon_…` id, persisted to `.pi-ssh-monitors/<id>.json`, offsets 0 (fresh
+logs), auto-removed when the job ends — i.e. exactly `ssh_monitor create`. The
+`logWatches` schema gained `notify?`/`template?` (strings, parsed + validated
+before launch). `notify.json` no longer carries `watches`.
+
+Back-compat: a **legacy shim** (`armLegacyWatches`, `kind:"legacy"`) rebuilds
+in-memory every-match monitors from a *pre-upgrade* running job's
+`notify.json.watches` on rehydrate/attach (deterministic ids, not persisted, not
+editable). New jobs write no `watches`, so the shim is a no-op for them. This is
+the single concession to the old format; everything else is one uniform store.
 
 ---
 
@@ -215,8 +220,11 @@ ship logWatches policies as 2d only if cheap.
   `notify`/`template` persisted in `MonitorFile` + rehydrated (absent ⇒
   every-match); `create`/`update` validate (milestone needs `(?<total>…)`);
   `ssh_monitor` gained `notify=`/`template=` params + a policy column in `list`.
-- **2d — (optional) logWatches policies.** Not started. Extend `WatchSpec` +
-  `ssh_process` schema per §6; sugar monitors are every-match until then.
+- **2d — logWatches as first-class monitors.** ✅ `ssh_process start` desugars each
+  logWatch to a persisted standalone monitor via `monitors.createForProcess`
+  (best-effort persist so a write failure never fails the launched job); schema
+  gained `notify`/`template`, validated pre-launch. The `sugar` kind is gone;
+  only a `legacy` back-compat shim remains for pre-upgrade jobs (§6).
 
 ---
 

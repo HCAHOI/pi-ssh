@@ -16,12 +16,16 @@ export interface SshTarget {
 	originArg?: string;
 }
 
-// logWatches param shape on ssh_process; also the persisted home of process-bound
-// monitors inside a job's notify.json (desugared by src/monitor.ts).
+// logWatches param shape on ssh_process. Each logWatch is desugared into a
+// first-class standalone monitor at start (src/monitor.ts createForProcess).
+// `notify`/`template` are the raw tool-arg strings (parsed by parseNotifyPolicy).
+// Legacy notify.json from pre-upgrade jobs carries only pattern/stream/repeat.
 export interface WatchSpec {
 	pattern: string;
 	stream?: "stdout" | "stderr" | "both";
 	repeat?: boolean;
+	notify?: string;
+	template?: string;
 }
 
 export interface PollerState {

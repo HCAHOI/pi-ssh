@@ -17,7 +17,7 @@ function formatRows(rows: MonitorRow[]): string {
 		.map((r) => {
 			const state = r.paused ? "paused" : r.fired && !r.repeat ? "fired" : "active";
 			const name = r.name ? ` ${r.name}` : "";
-			const kind = r.kind === "sugar" ? " (ssh_process)" : "";
+			const kind = r.kind === "legacy" ? " (legacy)" : "";
 			return `${r.id}${name}${kind}\t${r.source}\t/${r.pattern}/\t${r.notify}\t${state}\tmatches=${r.matchCount}`;
 		})
 		.join("\n");

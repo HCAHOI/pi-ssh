@@ -16,10 +16,10 @@ import { sendProcessMessage } from "./notify";
 
 const POLL_INTERVAL_MS = 3000;
 
-// Persisted per-job notify config (notify.json). `watches` is retained for the
-// ssh_process logWatches sugar: it is the on-disk home of process-bound monitors,
-// which the monitor subsystem desugars on (re)connect (MONITOR_PLAN §6). The
-// completion poller itself no longer reads it.
+// Persisted per-job notify config (notify.json). New jobs persist only the
+// completion-alert prefs; `watches` is kept optional ONLY to read pre-upgrade
+// jobs whose logWatches still live here (the monitor subsystem's legacy shim
+// rebuilds them). The completion poller itself never reads `watches`.
 export interface NotifyConfig {
 	name?: string;
 	alertOnSuccess?: boolean;

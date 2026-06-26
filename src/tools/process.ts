@@ -10,7 +10,8 @@ import { shQuote } from "../utils";
 import { runRemoteCommand, sshFailureMessage } from "../ssh/transport";
 import { createRemoteBashOps } from "../remote-ops";
 import type { NotifyConfig } from "../poller";
-import { validateWatchPatterns } from "../monitor";
+import { assertPolicyMatchesPattern, compilePattern, validateWatchPatterns, type ProcessWatch } from "../monitor";
+import { parseNotifyPolicy } from "../notify-policy";
 import {
 	buildClearCommand,
 	buildKillCommand,
@@ -48,9 +49,11 @@ export function setupProcessTool(ssh: SshContext): void {
 			alertOnFailure: Type.Optional(Type.Boolean({ description: "start: notify when the job exits non-zero (default true)" })),
 			alertOnKill: Type.Optional(Type.Boolean({ description: "start: notify when the job is killed by a signal (default false)" })),
 			logWatches: Type.Optional(Type.Array(Type.Object({
-				pattern: Type.String({ description: "Regex matched per log line" }),
+				pattern: Type.String({ description: "Regex matched per log line; named groups (?<x>…) feed {x} template/ETA vars" }),
 				stream: Type.Optional(Type.Union([Type.Literal("stdout"), Type.Literal("stderr"), Type.Literal("both")], { description: "Which stream to watch (default both)" })),
-				repeat: Type.Optional(Type.Boolean({ description: "Fire every match (default false: one-shot)" })),
+				repeat: Type.Optional(Type.Boolean({ description: "Fire every match (default false: one-shot). Ignored unless notify=every-match." })),
+				notify: Type.Optional(Type.String({ description: "Notify policy: every-match | every-n:N | throttle:DUR | digest:DUR | milestone:f1,f2,… (DUR like 90s/5m/1h)" })),
+				template: Type.Optional(Type.String({ description: "Notification body template; {token} = named captures + {count}/{matchCount}/{line}/{total}/{pct}/{eta}" })),
 			}), { description: "start: notify when a log line matches; re-engages the agent" })),
 		}),
 		renderCall(args: any, theme: any, context: any) {
@@ -86,19 +89,26 @@ export function setupProcessTool(ssh: SshContext): void {
 			const root = processRoot(t);
 			if (params.action === "start") {
 				if (!params.command?.trim()) throw new Error("ssh_process start requires command");
-				validateWatchPatterns(params.logWatches); // fail fast on a bad regex before launching
+				// Resolve each logWatch to a first-class monitor spec, validating BEFORE we
+				// launch (bad regex / bad policy / milestone-without-total fail fast).
+				const watchSpecs: ProcessWatch[] = (params.logWatches ?? []).map((w) => {
+					compilePattern(w.pattern);
+					const notify = parseNotifyPolicy(w.notify);
+					assertPolicyMatchesPattern(notify, w.pattern);
+					return { pattern: w.pattern, stream: w.stream, repeat: w.repeat, notify, template: w.template };
+				});
 				const procId = `${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
 				const dir = `${root}/${procId}`;
 				const name = params.name?.trim() || procId;
 				const script = processRunScript(t, { command: params.command, cwd: params.cwd, env: params.env, commandPrefix: params.commandPrefix }, localCwd);
-				// Persist the notification config so pollers can be re-armed after a
-				// reconnect / pi restart (poller.rehydrate reads this).
+				// Persist the completion-notification config so pollers re-arm after a
+				// reconnect / pi restart (poller.rehydrate reads this). logWatches are NOT
+				// written here anymore — each becomes its own standalone monitor file below.
 				const notifyJson = JSON.stringify({
 					name,
 					alertOnSuccess: params.alertOnSuccess ?? false,
 					alertOnFailure: params.alertOnFailure ?? true,
 					alertOnKill: params.alertOnKill ?? false,
-					watches: params.logWatches ?? [],
 				} satisfies NotifyConfig);
 				const cmd = [
 					`mkdir -p ${shQuote(dir)}`,
@@ -128,11 +138,11 @@ export function setupProcessTool(ssh: SshContext): void {
 					alertOnKill: params.alertOnKill ?? false,
 					startedAt: Date.now(),
 				});
-				// logWatches is sugar for process-bound monitors: arm them from the fresh
-				// (empty) logs so they sweep from the top, exactly as before. The watch
-				// specs persist in notify.json and rehydrate via the monitor subsystem.
-				const watchCount = params.logWatches?.length ?? 0;
-				if (watchCount) monitors.armSugarWatches(t, procId, params.logWatches ?? [], { name });
+				// Each logWatch becomes a first-class, persisted standalone monitor bound to
+				// this job (== ssh_monitor create). They sweep the fresh logs from the top
+				// and auto-remove when the job ends; manageable via ssh_monitor.
+				const watchCount = watchSpecs.length;
+				if (watchCount) await monitors.createForProcess(t, procId, watchSpecs, name);
 				// Point-of-need discovery: this job already alerts on failure; nudge the
 				// agent toward success/log-watch notifications only when it did not opt in,
 				// so it stops polling list/output. Suppressed once the feature is used.
@@ -194,10 +204,11 @@ export function setupProcessTool(ssh: SshContext): void {
 					alertOnFailure: cfg.alertOnFailure,
 					alertOnKill: cfg.alertOnKill,
 				});
-				// Re-arm the job's logWatch monitors, seeking to current EOF so historical
-				// lines are not re-matched (mirrors the monitor rehydrate rule).
+				// Re-arm the job's watches via the legacy in-memory shim (attach is a
+				// re-arm path; the first-class way to add a monitor to a running job is
+				// ssh_monitor create). Seek to current EOF so history is not re-matched.
 				if (cfg.watches.length) {
-					monitors.armSugarWatches(t, params.id, cfg.watches, { offsets: { stdout: Number.parseInt(outStr, 10) || 0, stderr: Number.parseInt(errStr, 10) || 0 }, name: cfg.name });
+					monitors.armLegacyWatches(t, params.id, cfg.watches, { offsets: { stdout: Number.parseInt(outStr, 10) || 0, stderr: Number.parseInt(errStr, 10) || 0 }, name: cfg.name });
 				}
 				return { content: [{ type: "text" as const, text: `Watching ${params.id} (${cfg.name}). Will notify on completion${cfg.watches.length ? " and matching log lines" : ""}.` }] };
 			}

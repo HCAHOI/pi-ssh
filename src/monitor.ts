@@ -40,9 +40,10 @@ export interface MonitorFile {
 
 interface MonitorState {
 	id: string;
-	/** standalone = created via ssh_monitor (persisted); sugar = desugared from an
-	 * ssh_process logWatches param (lives in the job's notify.json, not persisted here). */
-	kind: "standalone" | "sugar";
+	/** standalone = a first-class monitor persisted in .pi-ssh-monitors (created via
+	 * ssh_monitor OR desugared from ssh_process logWatches); legacy = a back-compat
+	 * shim rebuilt in-memory from an OLD job's notify.json watches (not persisted). */
+	kind: "standalone" | "legacy";
 	source: MonitorSource;
 	pattern: string;
 	re: RegExp;
@@ -71,7 +72,7 @@ interface MonitorState {
 
 export interface MonitorRow {
 	id: string;
-	kind: "standalone" | "sugar";
+	kind: "standalone" | "legacy";
 	source: string;
 	pattern: string;
 	repeat: boolean;
@@ -91,6 +92,16 @@ export interface CreateMonitorOpts {
 	template?: string;
 }
 
+/** One logWatch resolved to a monitor spec (notify already parsed), bound to the
+ * job at ssh_process start via createForProcess. */
+export interface ProcessWatch {
+	pattern: string;
+	stream?: "stdout" | "stderr" | "both";
+	repeat?: boolean;
+	notify?: NotifyPolicy;
+	template?: string;
+}
+
 export interface UpdateMonitorPatch {
 	pattern?: string;
 	repeat?: boolean;
@@ -102,8 +113,12 @@ export interface UpdateMonitorPatch {
 export interface MonitorManager {
 	/** Create a standalone monitor; seeks the source to EOF so history does not re-fire. */
 	create(t: SshTarget, opts: CreateMonitorOpts): Promise<MonitorState>;
-	/** Arm process-sugar monitors for an ssh_process job's logWatches (deterministic ids). */
-	armSugarWatches(t: SshTarget, procId: string, watches: WatchSpec[], opts?: { offsets?: { stdout: number; stderr: number }; name?: string }): void;
+	/** Create first-class, persisted monitors for an ssh_process job's logWatches
+	 * (the standard path: each logWatch == an ssh_monitor create). */
+	createForProcess(t: SshTarget, procId: string, watches: ProcessWatch[], name?: string): Promise<void>;
+	/** Back-compat shim: rebuild in-memory every-match monitors from an OLD job's
+	 * notify.json watches (deterministic ids, not persisted). Only legacy jobs hit this. */
+	armLegacyWatches(t: SshTarget, procId: string, watches: WatchSpec[], opts?: { offsets?: { stdout: number; stderr: number }; name?: string }): void;
 	list(): MonitorRow[];
 	update(id: string, patch: UpdateMonitorPatch): Promise<MonitorState>;
 	pause(id: string): Promise<void>;
@@ -134,6 +149,14 @@ export function compilePattern(pattern: string): RegExp {
 /** Validate logWatch patterns before launching a job (so a bad regex fails fast). */
 export function validateWatchPatterns(watches: WatchSpec[] | undefined): void {
 	for (const w of watches ?? []) compilePattern(w.pattern);
+}
+
+// A milestone policy computes progress from a `total` capture; without it there is
+// nothing to measure against. Validate at create/update/start time (fail fast).
+export function assertPolicyMatchesPattern(notify: NotifyPolicy, pattern: string): void {
+	if (notify.mode === "milestone" && !/\(\?<total>/.test(pattern)) {
+		throw new Error(`milestone policy needs a (?<total>…) named capture group in the pattern to measure progress; got /${pattern}/`);
+	}
 }
 
 function streamsOf(stream: "stdout" | "stderr" | "both"): Array<"stdout" | "stderr"> {
@@ -349,7 +372,7 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 
 	function buildState(args: {
 		id: string;
-		kind: "standalone" | "sugar";
+		kind?: "standalone" | "legacy";
 		source: MonitorSource;
 		pattern: string;
 		repeat: boolean;
@@ -363,7 +386,7 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 		const notify = args.notify ?? EVERY_MATCH;
 		return {
 			id: args.id,
-			kind: args.kind,
+			kind: args.kind ?? "standalone",
 			source: args.source,
 			pattern: args.pattern,
 			re: compilePattern(args.pattern),
@@ -385,14 +408,6 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 		};
 	}
 
-	// A milestone policy computes progress from a `total` capture; without it there
-	// is nothing to measure against. Validate at create/update time (fail fast).
-	function assertPolicyMatchesPattern(notify: NotifyPolicy, pattern: string): void {
-		if (notify.mode === "milestone" && !/\(\?<total>/.test(pattern)) {
-			throw new Error(`milestone policy needs a (?<total>…) named capture group in the pattern to measure progress; got /${pattern}/`);
-		}
-	}
-
 	async function create(t: SshTarget, opts: CreateMonitorOpts): Promise<MonitorState> {
 		compilePattern(opts.pattern); // fail fast before any remote round-trip
 		assertPolicyMatchesPattern(opts.notify ?? EVERY_MATCH, opts.pattern);
@@ -410,16 +425,36 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 		return state;
 	}
 
-	function armSugarWatches(t: SshTarget, procId: string, watches: WatchSpec[], opts?: { offsets?: { stdout: number; stderr: number }; name?: string }): void {
+	// Standard path: ssh_process start desugars each logWatch into a first-class,
+	// persisted standalone monitor bound to the just-started job. The logs are fresh
+	// (empty) so offsets start at 0 (== EOF), and the process is necessarily running,
+	// so we skip the status/EOF probes create() does.
+	async function createForProcess(t: SshTarget, procId: string, watches: ProcessWatch[], name?: string): Promise<void> {
+		for (const w of watches) {
+			const stream = w.stream ?? "both";
+			const id = `mon_${Date.now().toString(36)}-${randomBytes(3).toString("hex")}`;
+			const off: Record<string, number> = {};
+			for (const s of streamsOf(stream)) off[s] = 0;
+			const state = buildState({ id, kind: "standalone", source: { kind: "process", procId, stream }, pattern: w.pattern, repeat: w.repeat ?? false, name, paused: false, target: t, off, notify: w.notify, template: w.template });
+			addMonitor(state);
+			// Best-effort: the in-memory monitor is armed regardless; a failed file write
+			// only costs cross-restart persistence, it must not fail the already-started job.
+			await persist(state).catch(() => {});
+		}
+	}
+
+	// Back-compat shim ONLY: rebuild in-memory every-match monitors from an OLD job's
+	// notify.json watches (jobs started before logWatches became first-class). New
+	// jobs write no watches to notify.json, so this is a no-op for them. Deterministic
+	// ids keep it idempotent across reconnects; legacy monitors are not persisted.
+	function armLegacyWatches(t: SshTarget, procId: string, watches: WatchSpec[], opts?: { offsets?: { stdout: number; stderr: number }; name?: string }): void {
 		watches.forEach((w, i) => {
 			const id = `${procId}#w${i}`;
 			if (monitors.has(id)) return;
 			const stream = w.stream ?? "both";
 			const off: Record<string, number> = {};
 			for (const s of streamsOf(stream)) off[s] = opts?.offsets ? opts.offsets[s] : 0;
-			// Sugar (logWatches) monitors are every-match for back-compat (Phase 1
-			// behavior). Per-watch policies are a future opt-in (Phase 2d).
-			const state = buildState({ id, kind: "sugar", source: { kind: "process", procId, stream }, pattern: w.pattern, repeat: w.repeat ?? false, name: opts?.name, paused: false, target: t, off });
+			const state = buildState({ id, kind: "legacy", source: { kind: "process", procId, stream }, pattern: w.pattern, repeat: w.repeat ?? false, name: opts?.name, paused: false, target: t, off });
 			addMonitor(state);
 		});
 	}
@@ -447,7 +482,7 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 
 	async function update(id: string, patch: UpdateMonitorPatch): Promise<MonitorState> {
 		const m = getMonitor(id);
-		if (m.kind === "sugar") throw new Error(`${id} is a process-sugar monitor (from ssh_process logWatches); it cannot be edited. Create a standalone monitor with ssh_monitor create instead.`);
+		if (m.kind === "legacy") throw new Error(`${id} is a legacy monitor rebuilt from an old ssh_process job's notify.json; it cannot be edited. Re-attach the job (ssh_process attach) or create a fresh monitor with ssh_monitor create.`);
 		// Validate everything before mutating any field (so a bad patch leaves the
 		// monitor untouched).
 		const nextPattern = patch.pattern ?? m.pattern;
@@ -500,9 +535,10 @@ export function createMonitorManager(pi: ExtensionAPI): MonitorManager {
 	}
 
 	// Re-arm monitors after a (re)connect or pi restart: standalone monitors from
-	// their persisted files, and process-sugar monitors desugared from each running
-	// job's notify.json watches. Each source offset seeks to EOF so historical lines
-	// do not re-fire. Already-live monitors are skipped (idempotent ids).
+	// their persisted files, plus a back-compat shim that rebuilds every-match
+	// monitors from each RUNNING old job's notify.json watches (new jobs write none).
+	// Each source offset seeks to EOF so historical lines do not re-fire. Already-live
+	// monitors are skipped (idempotent ids).
 	async function rehydrate(t: SshTarget): Promise<void> {
 		if (!t.hasPython) return;
 		const mroot = monitorRoot(t);
@@ -588,7 +624,9 @@ print(json.dumps({'monitors': mons, 'procs': procs}))
 				await runRemoteCommand(t, `rm -f -- ${shQuote(`${mroot}/${spec.id}.json`)}`, { timeout: 20, login: false }).catch(() => {});
 			}
 		}
-		// Process-sugar monitors desugared from each RUNNING job's notify.json watches.
+		// Legacy shim: rebuild every-match monitors from each RUNNING OLD job's
+		// notify.json watches. New jobs write no watches here (logWatches are persisted
+		// as standalone monitor files above), so this only fires for pre-upgrade jobs.
 		for (const [procId, proc] of Object.entries(parsed.procs)) {
 			if (!proc.running || !proc.notify) continue;
 			let cfg: { watches?: WatchSpec[]; name?: string };
@@ -604,7 +642,7 @@ print(json.dumps({'monitors': mons, 'procs': procs}))
 				if (monitors.has(id)) return;
 				const stream = w.stream ?? "both";
 				try {
-					const state = buildState({ id, kind: "sugar", source: { kind: "process", procId, stream }, pattern: w.pattern, repeat: w.repeat ?? false, name: procName, paused: false, target: t, off: eofFor(proc, stream) });
+					const state = buildState({ id, kind: "legacy", source: { kind: "process", procId, stream }, pattern: w.pattern, repeat: w.repeat ?? false, name: procName, paused: false, target: t, off: eofFor(proc, stream) });
 					addMonitor(state);
 				} catch {
 					// Skip an unusable watch (e.g. bad regex from a hand-edited notify.json)
@@ -616,7 +654,8 @@ print(json.dumps({'monitors': mons, 'procs': procs}))
 
 	return {
 		create,
-		armSugarWatches,
+		createForProcess,
+		armLegacyWatches,
 		list,
 		update,
 		pause,

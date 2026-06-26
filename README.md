@@ -117,9 +117,13 @@ never loop on `list`/`output`:
 - `alertOnSuccess` (default `false`), `alertOnFailure` (default `true`),
   `alertOnKill` (default `false`) — fire on exit, classified by exit code
   (`0` success / `>=128` or missing `exit_code` killed / other failure).
-- `logWatches: [{ pattern, stream?, repeat? }]` — fire when a remote log line
-  matches a regex (`stream` default `both`, `repeat` default one-shot). This is
-  sugar: each watch becomes a process-bound **monitor** (see `ssh_monitor`).
+- `logWatches: [{ pattern, stream?, repeat?, notify?, template? }]` — fire when a
+  remote log line matches a regex (`stream` default `both`). Each logWatch is
+  **sugar for `ssh_monitor create`**: at start it becomes a first-class,
+  persisted monitor bound to the job (visible in `ssh_monitor list`, manageable
+  with `update`/`pause`/`remove`), so the full notify-policy grammar applies —
+  e.g. `notify: "digest:30s"`, `template: "{n}/{total} ETA {eta}"`. See
+  `ssh_monitor` below for policies/captures.
 
 Completion notifications report the run duration and, when a **newer run of the
 same `name`** was started after this one, tag the alert
@@ -200,10 +204,11 @@ need a `total` capture). A non-`every-match` policy keeps matching regardless of
   and **re-arm on every (re)connect / pi restart** (seeking each source to EOF),
   exactly like process completion notifications. They auto-remove when their
   bound process is cleared or exits.
-- A monitor created from `ssh_process logWatches` is shown in `list` tagged
-  `(ssh_process)`; it lives in the job's `notify.json`. `update` only edits
-  standalone monitors; `pause/resume/remove` on a sugar monitor are
-  session-scoped (reset on the next reconnect, driven by `notify.json`).
+- `ssh_process --logWatches` monitors are ordinary standalone monitors (same
+  store, fully manageable here) — there is no second-class "sugar" tier. Monitors
+  tagged `(legacy)` in `list` are a back-compat shim rebuilt from a pre-upgrade
+  job's `notify.json` (every-match, not editable); re-`attach` or recreate them to
+  get a first-class monitor.
 
 ## Transfer (`ssh_push` / `ssh_pull`)
 

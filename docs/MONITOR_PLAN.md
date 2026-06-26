@@ -189,9 +189,11 @@ What we explicitly reuse from current code: `fetchDeltaLines` (generalized),
 
 ## 6. Persistence & rehydrate
 
-- Process-bound monitors created via `ssh_process logWatches` sugar keep living
-  in the job's `notify.json` (back-compat; desugared to a `MonitorSpec` at load).
-- Standalone monitors get a target-level store: `<processRoot>/../.pi-ssh-monitors/<mon_id>.json`
+- **(Updated in Phase 2d)** `ssh_process logWatches` no longer live in
+  `notify.json`; each desugars to a first-class standalone monitor file at start
+  (`createForProcess`). A `legacy` shim still rebuilds in-memory monitors from a
+  *pre-upgrade* job's `notify.json.watches` for back-compat.
+- All monitors get a target-level store: `<remoteCwd>/.pi-ssh-monitors/<mon_id>.json`
   (parallel to `.pi-ssh-processes/`), since they can bind to non-process sources.
 - Extend `rehydratePollers()` (or add `rehydrateMonitors()`) to re-arm monitors
   on (re)connect, seeking each source offset to EOF so history doesn't re-fire —
