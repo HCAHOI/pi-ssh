@@ -149,7 +149,7 @@ Manage:
 			if (t.defaultEnv && Object.keys(t.defaultEnv).length) push(`    ${T.fg("dim", "env")}  ${T.fg("muted", Object.keys(t.defaultEnv).join(", "))}`);
 			const activeTunnels = ctx.tunnels.list();
 			if (activeTunnels.length) {
-				const tn = activeTunnels.map((x) => `localhost:${x.localPort}\u2192${x.remoteHost}:${x.remotePort}`).join(", ");
+				const tn = activeTunnels.map((x) => `localhost:${x.localPort}\u2192${x.remoteHost}:${x.remotePort}${x.saved ? " [saved]" : ""}`).join(", ");
 				push(`    ${T.fg("dim", "tunnels")}  ${T.fg("muted", tn)}`);
 			}
 			const syncStatus = ctx.sync.getState();

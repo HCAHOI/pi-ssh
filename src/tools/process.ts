@@ -19,6 +19,7 @@ import {
 	listProcesses,
 	processRoot,
 	processRunScript,
+	resolveProcessRef,
 } from "../process-queries";
 
 export function setupProcessTool(ssh: SshContext): void {
@@ -32,13 +33,14 @@ export function setupProcessTool(ssh: SshContext): void {
 		promptSnippet: "Manage long-running remote SSH processes",
 		promptGuidelines: [
 			"Use ssh_process start for long-running remote jobs; use output/logs to inspect and kill to stop.",
+			"For ssh_process output/logs/kill/attach, prefer name over id when the job was started with a stable name; name resolves to the newest matching run (kill prefers a running run).",
 			"Completion/logWatch notifications re-engage the agent, so do not poll. For file/probe/stall/digest monitors, see /ssh help monitor.",
 		],
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("start"), Type.Literal("list"), Type.Literal("output"), Type.Literal("logs"), Type.Literal("kill"), Type.Literal("clear"), Type.Literal("attach")]),
-			name: Type.Optional(Type.String({ description: "Friendly process name for start" })),
+			name: Type.Optional(Type.String({ description: "Friendly process name for start; for output/logs/kill/attach, resolves to the newest matching run when id is omitted" })),
 			command: Type.Optional(Type.String({ description: "Command to start on the remote" })),
-			id: Type.Optional(Type.String({ description: "Remote process id returned by start/list" })),
+			id: Type.Optional(Type.String({ description: "Remote process id returned by start/list. For output/logs/kill/attach, you may pass name instead." })),
 			cwd: Type.Optional(Type.String({ description: "Remote working directory, defaults to remote cwd" })),
 			env: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Environment variables exported before command" })),
 			commandPrefix: Type.Optional(Type.String({ description: "Shell code run before command" })),
@@ -63,7 +65,8 @@ export function setupProcessTool(ssh: SshContext): void {
 				const cmd = str(args?.command);
 				rest = `${theme.fg("accent", "start")}${nm}${cmd ? ` ${theme.fg("muted", `$ ${cmd}`)}` : ""}`;
 			} else if (a === "kill" || a === "output" || a === "logs" || a === "attach") {
-				rest = `${theme.fg("accent", a)}${args?.id ? ` ${theme.fg("muted", str(args.id))}` : ""}`;
+				const ref = args?.id ? str(args.id) : args?.name ? `name:${str(args.name)}` : "";
+				rest = `${theme.fg("accent", a)}${ref ? ` ${theme.fg("muted", ref)}` : ""}`;
 			} else {
 				rest = theme.fg("accent", a);
 			}
@@ -164,12 +167,15 @@ export function setupProcessTool(ssh: SshContext): void {
 				return { content: [{ type: "text" as const, text: r.stdout.toString().trim() }] };
 			}
 
-			if (!params.id?.trim()) throw new Error(`ssh_process ${params.action} requires id`);
-			const dir = `${root}/${params.id}`;
+			const rowsForNameResolution = params.id?.trim() ? [] : await listProcesses(t, signal);
+			const resolved = resolveProcessRef(rowsForNameResolution, { id: params.id, name: params.name }, { preferRunning: params.action === "kill" });
+			const procId = resolved.id;
+			const resolvedNote = resolved.matchedBy === "name" ? `Resolved process name "${params.name?.trim()}" -> ${procId}.\n` : "";
+			const dir = `${root}/${procId}`;
 
 			if (params.action === "attach") {
-				if (poller.has(params.id)) {
-					return { content: [{ type: "text" as const, text: `Already watching ${params.id}.` }] };
+				if (poller.has(procId)) {
+					return { content: [{ type: "text" as const, text: `${resolvedNote}Already watching ${procId}.` }] };
 				}
 				const probe = `d=${shQuote(dir)}; if [ ! -d "$d" ]; then echo 'process not found' >&2; exit 2; fi; o=$(wc -c < "$d/stdout.log" 2>/dev/null || echo 0); e=$(wc -c < "$d/stderr.log" 2>/dev/null || echo 0); n=$(base64 < "$d/notify.json" 2>/dev/null | tr -d '\n'); printf '%s\t%s\t%s\n' "$o" "$e" "$n"`;
 				const pr = await runRemoteCommand(t, probe, { signal, login: false });
@@ -179,7 +185,7 @@ export function setupProcessTool(ssh: SshContext): void {
 				if (notifyB64) {
 					try { saved = JSON.parse(Buffer.from(notifyB64, "base64").toString()); } catch { /* ignore corrupt config */ }
 				}
-				const name = params.name?.trim() || saved.name || params.id;
+				const name = params.name?.trim() || saved.name || procId;
 				const offsets = { stdout: Number.parseInt(outStr, 10) || 0, stderr: Number.parseInt(errStr, 10) || 0 };
 				// Explicit logWatches at attach are first-class (== ssh_monitor create),
 				// seeking EOF since the job is already running. Validate before persisting.
@@ -206,7 +212,7 @@ export function setupProcessTool(ssh: SshContext): void {
 				const persist = `d=${shQuote(dir)}; printf %s ${shQuote(JSON.stringify(persistCfg))} > "$d/notify.json"; rm -f "$d/notified"`;
 				await runRemoteCommand(t, persist, { signal, login: false }).catch(() => {});
 				poller.startPoller({
-					procId: params.id,
+					procId,
 					name,
 					dir,
 					target: t,
@@ -214,10 +220,10 @@ export function setupProcessTool(ssh: SshContext): void {
 					alertOnFailure: persistCfg.alertOnFailure ?? true,
 					alertOnKill: persistCfg.alertOnKill ?? false,
 				});
-				if (legacyWatches.length) monitors.armLegacyWatches(t, params.id, legacyWatches, { offsets, name });
-				if (userWatches.length) await monitors.createForProcess(t, params.id, userWatches, name, offsets);
+				if (legacyWatches.length) monitors.armLegacyWatches(t, procId, legacyWatches, { offsets, name });
+				if (userWatches.length) await monitors.createForProcess(t, procId, userWatches, name, offsets);
 				const watching = legacyWatches.length + userWatches.length;
-				return { content: [{ type: "text" as const, text: `Watching ${params.id} (${name}). Will notify on completion${watching ? " and matching log lines" : ""}.` }] };
+				return { content: [{ type: "text" as const, text: `${resolvedNote}Watching ${procId} (${name}). Will notify on completion${watching ? " and matching log lines" : ""}.` }] };
 			}
 
 			if (params.action === "output") {
@@ -241,21 +247,21 @@ export function setupProcessTool(ssh: SshContext): void {
 				const cmd = `d=${shQuote(dir)}; test -d "$d" || { echo 'process not found' >&2; exit 2; }; echo '--- stdout ---'; tail -n ${lines} "$d/stdout.log" 2>/dev/null || true; echo '--- stderr ---'; tail -n ${lines} "$d/stderr.log" 2>/dev/null || true; pid=$(cat "$d/pid" 2>/dev/null || true); if [ -f "$d/exit_code" ]; then echo "--- exited, code: $(cat "$d/exit_code") ---"; elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo "--- still running (pid $pid) ---"; else echo '--- exited (no exit code recorded) ---'; fi`;
 				const r = await runRemoteCommand(t, cmd, { signal });
 				if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
-				return { content: [{ type: "text" as const, text: r.stdout.toString() || "(no output)" }] };
+				return { content: [{ type: "text" as const, text: `${resolvedNote}${r.stdout.toString() || "(no output)"}` }] };
 			}
 
 			if (params.action === "logs") {
-				return { content: [{ type: "text" as const, text: `stdout: ${dir}/stdout.log\nstderr: ${dir}/stderr.log\nrun script: ${dir}/run.sh` }], details: { stdout: `${dir}/stdout.log`, stderr: `${dir}/stderr.log`, script: `${dir}/run.sh` } };
+				return { content: [{ type: "text" as const, text: `${resolvedNote}stdout: ${dir}/stdout.log\nstderr: ${dir}/stderr.log\nrun script: ${dir}/run.sh` }], details: { stdout: `${dir}/stdout.log`, stderr: `${dir}/stderr.log`, script: `${dir}/run.sh` } };
 			}
 
 			// Agent-initiated kill: drop the poller and any process-bound monitors first
 			// so they do not fire a spurious completion/watch notification for an expected
 			// teardown.
-			poller.stopPoller(params.id);
-			monitors.stopForProcess(params.id);
+			poller.stopPoller(procId);
+			monitors.stopForProcess(procId);
 			const r = await runRemoteCommand(t, buildKillCommand(dir), { signal });
 			if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
-			return { content: [{ type: "text" as const, text: r.stdout.toString().trim() }] };
+			return { content: [{ type: "text" as const, text: `${resolvedNote}${r.stdout.toString().trim()}` }] };
 		},
 	});
 }

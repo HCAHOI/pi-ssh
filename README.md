@@ -118,10 +118,13 @@ Use this for API keys / tokens / credentials instead of `ssh_write` or
 
 ## Background jobs (`ssh_process`)
 
-`start | list | output | logs | kill | clear`. Jobs run under
+`start | list | output | logs | kill | clear | attach`. Jobs run under
 `<remote-cwd>/.pi-ssh-processes/<id>/` (stdout.log, stderr.log, pid, exit_code).
 `list`/`output` report the captured exit code once a job finishes (via an EXIT
 trap, so it survives commands that call `exit`). `clear` prunes finished jobs.
+For `output`/`logs`/`kill`/`attach`, pass either `id` or `name`; a name resolves
+to the newest matching run (for `kill`, the newest running match wins first), so
+agents no longer need to copy opaque process ids for named jobs.
 
 ### Completion & log notifications (no polling)
 
@@ -252,11 +255,19 @@ Recursive `fs.watch` requires macOS/Windows (on Linux use `ssh_push`).
 `open | close | list`. Forwards a remote port to a local port via
 `ssh -O forward/cancel -L` over the shared ControlMaster, so a remote dev server
 / TensorBoard / Jupyter / web UI is reachable at `http://localhost:<localPort>`.
-Tunnels close automatically on disconnect.
+Tunnels are saved by default in `~/.pi/ssh-tunnels.json` and restored when you
+reconnect to the same `remote:cwd`; `close` removes the saved entry. Pass
+`save:false` for a temporary tunnel.
+
+`localPort=0` picks a free local port. `wait:true` performs an HTTP readiness
+probe against `http://127.0.0.1:<localPort><probePath>` (default `/`) before
+returning the final URL; it leaves the tunnel open and reports a warning if the
+probe times out.
 
 ```
 ssh_tunnel open  remotePort=8080            # localhost:8080 -> remote 127.0.0.1:8080
-ssh_tunnel open  localPort=9000 remotePort=6006   # TensorBoard
+ssh_tunnel open  localPort=0 remotePort=6006 wait=true   # auto local port + HTTP readiness
+ssh_tunnel open  localPort=9000 remotePort=6006 save=false   # temporary TensorBoard
 ssh_tunnel list
 ssh_tunnel close localPort=8080
 ```

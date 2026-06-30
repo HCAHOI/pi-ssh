@@ -325,9 +325,12 @@ export default function (pi: ExtensionAPI) {
 			poller.stopAll();
 			monitors.stopAll();
 		}
-		if (prev) await closeMaster(prev);
+		if (prev) {
+			ctx.tunnels.stopAll();
+			await closeMaster(prev);
+		}
 		target = next;
-		ctx.tunnels.stopAll();
+		await ctx.tunnels.restoreSaved(next);
 		await poller.rehydrate(next);
 		await monitors.rehydrate(next);
 		return next;
@@ -356,6 +359,10 @@ export default function (pi: ExtensionAPI) {
 		const lines = [`SSH connected: ${t.remote}:${t.remoteCwd}${t.hasPython ? "" : " (no python3; ssh_edit uses fallback)"}`];
 		if (t.defaultCommandPrefix) lines.push(`  activation (every ssh_bash/ssh_process): ${t.defaultCommandPrefix}`);
 		if (t.defaultEnv && Object.keys(t.defaultEnv).length) lines.push(`  env: ${Object.keys(t.defaultEnv).join(", ")}`);
+		const activeTunnels = ctx.tunnels?.list?.() ?? [];
+		if (activeTunnels.length) {
+			lines.push(`  tunnels: ${activeTunnels.map((x) => `localhost:${x.localPort}->${x.remoteHost}:${x.remotePort}${x.saved ? " [saved]" : ""}`).join(", ")}`);
+		}
 		return lines.join("\n");
 	}
 

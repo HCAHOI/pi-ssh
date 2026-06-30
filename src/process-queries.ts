@@ -64,6 +64,31 @@ export async function listProcesses(t: SshTarget, signal?: AbortSignal): Promise
 	return parseProcRows(r.stdout.toString());
 }
 
+export interface ProcessRefResolution {
+	id: string;
+	row?: ProcRow;
+	matchedBy: "id" | "name";
+}
+
+export function resolveProcessRef(
+	rows: ProcRow[],
+	ref: { id?: string; name?: string },
+	opts?: { preferRunning?: boolean },
+): ProcessRefResolution {
+	const id = ref.id?.trim();
+	if (id) return { id, matchedBy: "id" };
+	const name = ref.name?.trim();
+	if (!name) throw new Error("ssh_process requires id or name for this action");
+	const matches = rows.filter((r) => r.name === name);
+	if (!matches.length) throw new Error(`No remote process named "${name}". Use ssh_process list to see available jobs.`);
+	matches.sort((a, b) => {
+		if (opts?.preferRunning && a.status !== b.status) return a.status === "running" ? -1 : 1;
+		const byStart = (b.startedMs ?? 0) - (a.startedMs ?? 0);
+		return byStart || b.id.localeCompare(a.id);
+	});
+	return { id: matches[0].id, row: matches[0], matchedBy: "name" };
+}
+
 export function buildKillCommand(dir: string): string {
 	return `d=${shQuote(dir)}; test -d "$d" || { echo 'process not found' >&2; exit 2; }; pid=$(cat "$d/pid" 2>/dev/null || true); test -n "$pid" || { echo 'pid not found' >&2; exit 2; }; kill "$pid" 2>/dev/null || true; sleep 1; kill -9 "$pid" 2>/dev/null || true; printf 'killed %s\n' "$pid"`;
 }

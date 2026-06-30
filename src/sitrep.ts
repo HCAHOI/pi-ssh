@@ -46,9 +46,9 @@ export function formatMonitorSection(rows: MonitorRow[]): string[] {
 	return lines;
 }
 
-export function formatTunnelSection(rows: Array<{ localPort: number; remoteHost: string; remotePort: number }>): string[] {
+export function formatTunnelSection(rows: Array<{ localPort: number; remoteHost: string; remotePort: number; saved?: boolean }>): string[] {
 	if (!rows.length) return ["Tunnels: none"];
-	return [`Tunnels (${rows.length}):`, ...rows.map((t) => `  localhost:${t.localPort} -> ${t.remoteHost}:${t.remotePort}`)];
+	return [`Tunnels (${rows.length}):`, ...rows.map((t) => `  localhost:${t.localPort} -> ${t.remoteHost}:${t.remotePort}${t.saved ? " [saved]" : ""}`)];
 }
 
 export function formatSyncSection(state: ReturnType<SshContext["sync"]["getState"]>): string[] {
