@@ -4,6 +4,7 @@
 
 import { Type } from "typebox";
 import type { SshContext } from "../context";
+import { formatSshSitrep } from "../sitrep";
 
 export function setupConnectionTools(ssh: SshContext): void {
 	const { pi, getTarget, switchTarget, disconnect, refreshStatus, connectedText, profileNames, render } = ssh;
@@ -50,15 +51,19 @@ export function setupConnectionTools(ssh: SshContext): void {
 	pi.registerTool({
 		name: "ssh_status",
 		label: "ssh_status",
-		description: "Show the active SSH remote used by ssh_* tools.",
+		description: "Show the active SSH remote used by ssh_* tools. Pass verbose:true for processes, monitors, tunnels, and sync state.",
 		promptSnippet: "Show active SSH connection status",
-		parameters: Type.Object({}),
+		parameters: Type.Object({
+			verbose: Type.Optional(Type.Boolean({ description: "Include processes, monitors, tunnels, and sync state (default false)" })),
+		}),
 		renderCall(_args: any, theme: any, context: any) {
 			return sshTitle("status", "", theme, context);
 		},
-		async execute() {
+		async execute(_id, params: { verbose?: boolean }) {
 			const t = getTarget();
-			const base = t ? connectedText(t) : "SSH: not connected";
+			if (!t) return { content: [{ type: "text" as const, text: "SSH: not connected" }] };
+			if (params.verbose) return { content: [{ type: "text" as const, text: await formatSshSitrep(ssh, t) }] };
+			const base = connectedText(t);
 			let profiles: string[] = [];
 			try { profiles = profileNames(); } catch { /* corrupt profiles file: ignore for status */ }
 			const profileLine = profiles.length ? `\nSaved profiles (reconnect with ssh_connect '@name'): ${profiles.map((n) => `@${n}`).join(", ")}` : "";

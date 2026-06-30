@@ -267,3 +267,36 @@ test("milestone: a single jump can cross multiple, reports highest", () => {
 	assert.equal(d.fire, true);
 	assert.equal(d.details?.milestone, 0.75); // highest crossed
 });
+
+test("milestone: flushes the crossed tail on close", () => {
+	const g = makeNotifyGate({ mode: "milestone", fractions: [0.5, 1.0] });
+	assert.equal(g.onMatch(ev({ matchCount: 20, captures: { n: "20", total: "40" }, now: 1000 })).details?.milestone, 0.5);
+	// The final line is read in the same sweep that observes process end; close must
+	// surface the final milestone even if no later scheduler tick happens.
+	assert.equal(g.onMatch(ev({ matchCount: 40, captures: { n: "40", total: "40" }, now: 2000 })).fire, true);
+	assert.equal(g.onClose(2100).fire, false); // already emitted on match
+
+	const late = makeNotifyGate({ mode: "milestone", fractions: [0.5, 1.0] });
+	late.onMatch(ev({ matchCount: 39, captures: { n: "39", total: "40" }, now: 1000 })); // fires 50% only
+	const close = late.onClose(2000);
+	assert.equal(close.fire, false); // no new crossed fraction without a 40/40 match
+});
+
+test("milestone: close is idempotent and uses template vars", () => {
+	const g = makeNotifyGate({ mode: "milestone", fractions: [1.0] }, { template: "done {n}/{total} pct={pct} eta={eta}" });
+	g.onMatch(ev({ matchCount: 40, captures: { n: "40", total: "40" }, now: 1000 }));
+	// It fired on match, so close should not re-fire.
+	assert.equal(g.onClose(1500).fire, false);
+
+	const noImmediate = makeNotifyGate({ mode: "milestone", fractions: [1.0] }, { template: "done {n}/{total} pct={pct} eta={eta}" });
+	const match = noImmediate.onMatch(ev({ matchCount: 40, captures: { n: "40", total: "40" }, now: 1000 }));
+	assert.equal(match.text, "done 40/40 pct=100 eta=0s");
+	assert.equal(noImmediate.onClose(2000).fire, false);
+});
+
+test("milestone: close does not fire without a usable cached match", () => {
+	const g = makeNotifyGate({ mode: "milestone", fractions: [0.5] });
+	assert.equal(g.onClose(1000).fire, false);
+	g.onMatch(ev({ matchCount: 5, captures: {}, now: 1000 }));
+	assert.equal(g.onClose(2000).fire, false);
+});

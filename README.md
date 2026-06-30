@@ -46,6 +46,21 @@ remote jobs are running, so activity is visible without opening the dashboard.
 The agent-facing `ssh_*` tools are unchanged — this is a human/TUI affordance.
 Free-form connect strings and `cd` targets prefill the editor with `/ssh …`.
 
+### Agent sitrep (`ssh_status verbose=true`)
+
+`ssh_status` stays terse by default. Pass `verbose: true` when an agent needs the
+same one-call situational picture as the dashboard after reconnecting or taking
+over a long-running session:
+
+- connection + saved profiles
+- remote processes (running/finished, pid/exit, age)
+- active monitors and notification policies
+- open tunnels
+- auto-sync state
+
+Each subsection degrades independently: a transient process-listing failure is
+reported as a warning line instead of failing the whole status call.
+
 ### Connection profiles
 
 Save the active connection (key, host, cwd, activation, env) and reconnect with a

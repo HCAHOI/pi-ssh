@@ -279,27 +279,35 @@ export function makeNotifyGate(policy: NotifyPolicy, opts?: { template?: string 
 			const fractions = [...policy.fractions];
 			const fired = new Set<number>();
 			let startAt: number | null = null;
+			let lastEv: MatchEvent | null = null;
+			const maybeFire = (ev: MatchEvent, now: number): GateDecision => {
+				const p = progressVars(ev.captures, ev.matchCount, startAt, now);
+				if (p.total === undefined) return NO_FIRE; // no total → progress undefined, cannot milestone
+				const progress = p.done / p.total;
+				let hit: number | null = null;
+				for (const f of fractions) {
+					if (progress >= f && !fired.has(f)) {
+						fired.add(f);
+						hit = f; // keep the highest crossed fraction this match/close
+					}
+				}
+				if (hit === null) return NO_FIRE;
+				const etaLabel = p.eta ? ` · ETA ${p.eta}` : "";
+				const def = `reached ${Math.round(hit * 100)}% (${p.done}/${p.total})${etaLabel}`;
+				const vars: Record<string, string | number> = { ...ev.captures, matchCount: ev.matchCount, line: ev.line, ...progressTemplateVars(p) };
+				return { fire: true, text: render(def, vars), details: { milestone: hit, pct: p.pct } };
+			};
 			return {
 				onMatch: (ev) => {
 					if (startAt === null) startAt = ev.now;
-					const p = progressVars(ev.captures, ev.matchCount, startAt, ev.now);
-					if (p.total === undefined) return NO_FIRE; // no total → progress undefined, cannot milestone
-					const progress = p.done / p.total;
-					let hit: number | null = null;
-					for (const f of fractions) {
-						if (progress >= f && !fired.has(f)) {
-							fired.add(f);
-							hit = f; // keep the highest crossed fraction this match
-						}
-					}
-					if (hit === null) return NO_FIRE;
-					const etaLabel = p.eta ? ` · ETA ${p.eta}` : "";
-					const def = `reached ${Math.round(hit * 100)}% (${p.done}/${p.total})${etaLabel}`;
-					const vars: Record<string, string | number> = { ...ev.captures, matchCount: ev.matchCount, line: ev.line, ...progressTemplateVars(p) };
-					return { fire: true, text: render(def, vars), details: { milestone: hit, pct: p.pct } };
+					lastEv = ev;
+					return maybeFire(ev, ev.now);
 				},
 				onTick: () => NO_FIRE,
-				onClose: () => NO_FIRE,
+				// Flush a final crossed milestone if the process exits between scheduler
+				// ticks. This mirrors digest/every-n/throttle close-flush behavior and is
+				// idempotent because maybeFire records every emitted fraction in `fired`.
+				onClose: (now) => (lastEv ? maybeFire(lastEv, now) : NO_FIRE),
 			};
 		}
 	}
