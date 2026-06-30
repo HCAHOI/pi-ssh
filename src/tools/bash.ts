@@ -6,6 +6,22 @@ import { Type } from "typebox";
 import { createBashTool } from "@earendil-works/pi-coding-agent";
 import type { SshContext } from "../context";
 import { createRemoteBashOps } from "../remote-ops";
+import { compactNoisyOutput } from "../output-filter";
+
+// Apply compactNoisyOutput to every text block of a bash result, appending a
+// one-line note when anything was collapsed so the agent knows output was elided.
+function compactBashResult(result: any, command: string): any {
+	if (!result || !Array.isArray(result.content)) return result;
+	let note: string | null = null;
+	const content = result.content.map((block: any) => {
+		if (block?.type !== "text" || typeof block.text !== "string") return block;
+		const { text, stats } = compactNoisyOutput(command, block.text);
+		if (stats.compacted) note = `[ssh_bash] collapsed routine output: ${stats.original} \u2192 ${stats.kept} lines (verbose:true for raw).`;
+		return { ...block, text };
+	});
+	if (note) content.push({ type: "text", text: note });
+	return { ...result, content };
+}
 
 export function setupBashTool(ssh: SshContext): void {
 	const { pi, localCwd, requireTarget, buildSshBashCommand, render } = ssh;
@@ -16,12 +32,11 @@ export function setupBashTool(ssh: SshContext): void {
 		...localBash,
 		name: "ssh_bash",
 		label: "ssh_bash",
-		description: `Execute a bash command on the active SSH remote in the remote cwd. Supports optional env, commandPrefix, and delaySeconds. Use local bash for local commands. ${localBash.description}`,
+		description: "Execute a bash command on the active SSH remote. Use local bash for local commands; use ssh_process for long-running remote jobs.",
 		promptSnippet: "Execute bash commands on the active SSH remote",
 		promptGuidelines: [
-			"Use ssh_bash for remote testing or GPU/server commands. Use bash for local commands and local file operations.",
-			"For long-running work (downloads, training, dev servers), prefer ssh_process. An ssh_bash timeout closes the SSH connection and the remote command is likely terminated (SIGHUP); ssh_process survives disconnects and notifies you on completion.",
-			"Large remote output is truncated to the last 50KB and the FULL output is saved to a local temp file (footer 'Full output: /tmp/pi-bash-*.log'); page that file with the local read tool's offset/limit instead of re-running the command — and scope commands with head/tail/grep/sed when you only need part.",
+			"Use ssh_bash for short remote commands. Use local bash for local commands and ssh_process for long-running remote work.",
+			"Routine apt/pip/npm/docker progress lines are auto-collapsed to keep errors, warnings, summaries, and a tail; pass verbose:true to see raw output. If output is large/truncated, read the reported full log path instead of rerunning.",
 		],
 		parameters: Type.Object({
 			command: Type.String({ description: "Bash command to execute on the active SSH remote" }),
@@ -31,6 +46,7 @@ export function setupBashTool(ssh: SshContext): void {
 			env: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Environment variables exported before command, e.g. {\"PYTHONSRC\": \"/path\"}" })),
 			commandPrefix: Type.Optional(Type.String({ description: "Shell code run before command, e.g. 'source .venv/bin/activate'" })),
 			tty: Type.Optional(Type.Boolean({ description: "Allocate a remote pty (ssh -tt) for commands that need a terminal (progress bars, some CLIs). Default false." })),
+			verbose: Type.Optional(Type.Boolean({ description: "Skip auto-compaction of noisy apt/pip/npm/docker output and return raw text. Default false." })),
 		}),
 		renderCall(args: any, theme: any, context: any) {
 			const cmd = str(args?.command);
@@ -43,7 +59,7 @@ export function setupBashTool(ssh: SshContext): void {
 		},
 		async execute(
 			id,
-			params: { command: string; timeout?: number; cwd?: string; delaySeconds?: number; env?: Record<string, string>; commandPrefix?: string; tty?: boolean },
+			params: { command: string; timeout?: number; cwd?: string; delaySeconds?: number; env?: Record<string, string>; commandPrefix?: string; tty?: boolean; verbose?: boolean },
 			signal,
 			onUpdate,
 			_ctx,
@@ -51,13 +67,17 @@ export function setupBashTool(ssh: SshContext): void {
 			const t = requireTarget();
 			const tool = createBashTool(localCwd, { operations: createRemoteBashOps(t, localCwd, { tty: params.tty }) });
 			try {
-				return await tool.execute(
+				const result = await tool.execute(
 					id,
 					{ command: buildSshBashCommand(t, params), timeout: params.timeout },
 					signal,
 					onUpdate,
 					_ctx,
 				);
+				if (params.verbose) return result;
+				// Collapse routine apt/pip/npm/docker progress noise in the text blocks,
+				// keeping errors/warnings/summaries/tail. Other commands pass through.
+				return compactBashResult(result, params.command);
 			} catch (e) {
 				// Make the timeout outcome unambiguous: say it WAS a timeout, what it did
 				// to the remote, and what to use instead. The SDK formats the timeout as

@@ -118,7 +118,11 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const rows = await listProcesses(target);
 				const running = rows.filter((r) => r.status === "running").length;
-				uiRef.setWidget("ssh-procs", running > 0 ? [uiRef.theme.fg("accent", `ssh: ${running} running`)] : undefined);
+				const tunnelCount = ctx.tunnels?.list().length ?? 0;
+				const parts: string[] = [];
+				if (running > 0) parts.push(`${running} running`);
+				if (tunnelCount > 0) parts.push(`${tunnelCount} tunnel${tunnelCount === 1 ? "" : "s"}`);
+				uiRef.setWidget("ssh-procs", parts.length ? [uiRef.theme.fg("accent", `ssh: ${parts.join(" \u00b7 ")}`)] : undefined);
 			} catch {
 				/* transient: keep the last widget value, retry next tick */
 			} finally {
@@ -151,8 +155,22 @@ export default function (pi: ExtensionAPI) {
 		}
 		const label = statusLabel(target);
 		uiRef.setStatus("ssh", label ? uiRef.theme.fg("accent", label) : "");
-		if (phase === "recovered") uiRef.notify(`SSH reconnected: ${info.remote}`, "info");
-		else uiRef.notify(`SSH reconnect to ${info.remote} failed after ${info.max} attempts`, "error");
+		if (phase === "recovered") {
+			uiRef.notify(`SSH reconnected: ${info.remote}`, "info");
+			// The respawned master lost its -L forwards; re-issue tracked tunnels.
+			void ctx.tunnels?.restoreAll().then((res) => {
+				if (res.restored > 0 || res.failed > 0) {
+					uiRef?.notify(
+						res.failed === 0
+							? `SSH tunnels restored: ${res.restored}`
+							: `SSH tunnels restored: ${res.restored}, failed: ${res.failed}`,
+						res.failed === 0 ? "info" : "warning",
+					);
+				}
+			}).catch(() => {});
+		} else {
+			uiRef.notify(`SSH reconnect to ${info.remote} failed after ${info.max} attempts`, "error");
+		}
 	});
 
 	function tokenizeSshArgs(input: string): string[] {

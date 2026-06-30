@@ -40,6 +40,28 @@ export function setupDashboard(ctx: SshContext): void {
 		noMatch: (t: string) => theme.fg("warning", t),
 	});
 
+	const MONITOR_HELP = `ssh_monitor advanced examples
+
+Simple running-process watch:
+  ssh_monitor create source=process:<procId>:stderr pattern='error|failed'
+
+Watch a remote file, logrotate-safe:
+  ssh_monitor create source=file:/var/log/app.log pattern='READY|ERROR'
+
+Throttle noisy progress:
+  ssh_monitor create source=process:<procId>:stdout pattern='epoch (?<n>\\d+)/(?<total>\\d+)' notify=milestone:0.25,0.5,1.0
+  ssh_monitor create source=process:<procId>:stderr pattern='loss=(?<loss>[\\d.]+)' notify=throttle:60s
+
+Probe a metric:
+  ssh_monitor create source='probe:nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits' notifyWhen='value==0' intervalMs=60000 consecutive=3
+
+Detect stalls:
+  ssh_monitor create source=process:<procId>:stdout pattern='epoch' expectEveryMs=300000
+
+Manage:
+  ssh_monitor list | pause/resume/remove id=<mon_id> | attach
+`;
+
 	type DashMode = "main" | "connect" | "output";
 	const DASH_MAX_ROWS = 12;
 	const DASH_OUT_MAX_BYTES = 16 * 1024;
@@ -384,7 +406,7 @@ export function setupDashboard(ctx: SshContext): void {
 
 	// --- runtime connect/disconnect/status ---
 	pi.registerCommand("ssh", {
-		description: "SSH remote: /ssh [-i key] user@host[:/path] [--activate <cmd>] [--env K=V] | /ssh @profile | /ssh cd <dir> | /ssh save <name> | /ssh profiles | /ssh off | /ssh",
+		description: "SSH remote dashboard/connect. Subcommands: cd, save, profiles, help monitor, off.",
 		handler: async (args, cmdCtx) => {
 			const arg = args.trim();
 
@@ -397,6 +419,11 @@ export function setupDashboard(ctx: SshContext): void {
 				await disconnect();
 				refreshStatus(cmdCtx);
 				cmdCtx.ui.notify("SSH disconnected. Local tools remain local.", "info");
+				return;
+			}
+
+			if (arg === "help monitor" || arg === "monitor help") {
+				cmdCtx.ui.notify(MONITOR_HELP, "info");
 				return;
 			}
 

@@ -28,12 +28,11 @@ export function setupProcessTool(ssh: SshContext): void {
 	pi.registerTool({
 		name: "ssh_process",
 		label: "ssh_process",
-		description: "Manage long-running processes on the active SSH remote. Starts commands in the background with logs under remote .pi-ssh-processes/<id>/; supports start/list/output/logs/kill/clear/attach. output accepts followSeconds to live-stream new log lines; attach re-arms completion/log-watch notifications for an existing job. list and output report the captured exit code once a job finishes; clear prunes finished jobs. On start, alertOnSuccess/alertOnFailure/alertOnKill and logWatches push a notification (re-engaging the agent) when the job ends or a log line matches — so you never poll. Notifications survive Mac sleep AND reconnect/pi-restart: each job persists its notify config and pollers are re-armed on connect, sweeping missed completions/log lines.",
+		description: "Manage long-running remote jobs: start/list/output/logs/kill/clear/attach. Supports notifications; see /ssh help monitor for advanced watches.",
 		promptSnippet: "Manage long-running remote SSH processes",
 		promptGuidelines: [
-			"Use ssh_process start for long-running remote jobs such as training, dev servers, and log tails instead of blocking ssh_bash.",
-			"Use ssh_process output (optionally followSeconds) to inspect stdout/stderr and ssh_process kill to stop remote jobs.",
-			"Background jobs push a notification when they finish or a logWatch matches — rely on it instead of polling list/output. After a reconnect, use ssh_process attach <id> to resume notifications for a job started earlier.",
+			"Use ssh_process start for long-running remote jobs; use output/logs to inspect and kill to stop.",
+			"Completion/logWatch notifications re-engage the agent, so do not poll. For file/probe/stall/digest monitors, see /ssh help monitor.",
 		],
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("start"), Type.Literal("list"), Type.Literal("output"), Type.Literal("logs"), Type.Literal("kill"), Type.Literal("clear"), Type.Literal("attach")]),
@@ -49,11 +48,11 @@ export function setupProcessTool(ssh: SshContext): void {
 			alertOnFailure: Type.Optional(Type.Boolean({ description: "start: notify when the job exits non-zero (default true)" })),
 			alertOnKill: Type.Optional(Type.Boolean({ description: "start: notify when the job is killed by a signal (default false)" })),
 			logWatches: Type.Optional(Type.Array(Type.Object({
-				pattern: Type.String({ description: "Regex matched per log line; named groups (?<x>…) feed {x} template/ETA vars" }),
-				stream: Type.Optional(Type.Union([Type.Literal("stdout"), Type.Literal("stderr"), Type.Literal("both")], { description: "Which stream to watch (default both)" })),
-				repeat: Type.Optional(Type.Boolean({ description: "Fire every match (default false: one-shot). Ignored unless notify=every-match." })),
-				notify: Type.Optional(Type.String({ description: "Notify policy: every-match | every-n:N | throttle:DUR | digest:DUR | milestone:f1,f2,… (DUR like 90s/5m/1h)" })),
-				template: Type.Optional(Type.String({ description: "Notification body template; {token} = named captures + {count}/{matchCount}/{line}/{total}/{pct}/{eta}" })),
+				pattern: Type.String({ description: "Regex matched per log line" }),
+				stream: Type.Optional(Type.Union([Type.Literal("stdout"), Type.Literal("stderr"), Type.Literal("both")], { description: "Stream to watch (default both)" })),
+				repeat: Type.Optional(Type.Boolean({ description: "Fire repeatedly when allowed by notify policy" })),
+				notify: Type.Optional(Type.String({ description: "Policy: every-match | every-n:N | throttle:DUR | digest:DUR | milestone:f1,f2,…" })),
+				template: Type.Optional(Type.String({ description: "Notification template using named regex captures" })),
 			}), { description: "start: notify when a log line matches; re-engages the agent" })),
 		}),
 		renderCall(args: any, theme: any, context: any) {

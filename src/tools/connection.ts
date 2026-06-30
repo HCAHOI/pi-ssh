@@ -12,14 +12,14 @@ export function setupConnectionTools(ssh: SshContext): void {
 	pi.registerTool({
 		name: "ssh_connect",
 		label: "ssh_connect",
-		description: "Connect, reconnect, or switch the active SSH remote for ssh_* tools. Accepts the same target syntax as /ssh, e.g. '-i /path/key.pem root@host[:/absolute/path]'. Optional '--activate <cmd>' sets a shell prefix (e.g. venv activation) and repeatable '--env KEY=VALUE' sets environment, both applied to every ssh_bash and ssh_process. Local tools remain local.",
+		description: "Connect, reconnect, or switch the active SSH remote for ssh_* tools. Same target syntax as /ssh; supports --activate and repeated --env.",
 		promptSnippet: "Connect or switch the active SSH remote used by ssh_* tools",
 		promptGuidelines: [
-			"Use ssh_connect when the user asks to connect, disconnect, or switch SSH servers from within the agent session.",
-			"After ssh_connect succeeds, use ssh_bash/ssh_read/ssh_write/ssh_edit for remote operations; keep read/write/edit/bash for local work.",
+			"Use ssh_connect when the user asks to connect, disconnect, or switch SSH servers.",
+			"After connecting, use ssh_* tools for remote operations and local tools for local work.",
 		],
 		parameters: Type.Object({
-			target: Type.String({ description: "SSH target, e.g. '-i /path/key.pem root@host', 'user@host:/absolute/path', a saved profile '@name', or with persistent setup: 'root@host:/work --activate \"source .venv/bin/activate\" --env PYTHONPATH=/src'" }),
+			target: Type.String({ description: "SSH target: user@host[:/abs/path], ssh options, @profile, plus optional --activate/--env" }),
 		}),
 		renderCall(args: any, theme: any, context: any) {
 			return sshTitle("connect", theme.fg("accent", str(args?.target)), theme, context);

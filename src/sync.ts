@@ -101,9 +101,9 @@ export function createSyncManager(ctx: SshContext): SyncManager {
 	pi.registerTool({
 		name: "ssh_sync",
 		label: "ssh_sync",
-		description: "Auto-sync the local workspace to the active SSH remote on every local file change (debounced rsync, .gitignore-filtered). Removes the manual ssh_push step from the edit-locally/run-remotely loop. Actions: start | stop | status. Only one watcher at a time; stops on disconnect.",
+		description: "Auto-sync local files to the active SSH remote on change via debounced rsync. Actions: start | stop | status.",
 		promptSnippet: "Continuously rsync local edits to the remote on change",
-		promptGuidelines: ["Use ssh_sync start to keep the remote in lockstep with local edits instead of calling ssh_push after every change; stop it when done."],
+		promptGuidelines: ["Use ssh_sync start for edit-locally/run-remotely loops; stop it when done."],
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("start"), Type.Literal("stop"), Type.Literal("status")]),
 			localPath: Type.Optional(Type.String({ description: "Local path to watch+sync, defaults to current workspace" })),

@@ -46,7 +46,7 @@ export function setupFsTools(ssh: SshContext): void {
 		...localRead,
 		name: "ssh_read",
 		label: "ssh_read",
-		description: `Read a file from the active SSH remote. Relative paths are resolved under the remote cwd. Use local read for local files. ${localRead.description}`,
+		description: "Read a file from the active SSH remote. Relative paths resolve under the remote cwd; use local read for local files.",
 		promptSnippet: "Read files from the active SSH remote",
 		promptGuidelines: [
 			"Use ssh_read only for remote files. Use read for local files in the current local workspace.",
@@ -68,7 +68,7 @@ export function setupFsTools(ssh: SshContext): void {
 		...localLs,
 		name: "ssh_ls",
 		label: "ssh_ls",
-		description: `List directory contents on the active SSH remote. Relative paths are resolved under the remote cwd. Use local ls/find for local files. ${localLs.description}`,
+		description: "List a directory on the active SSH remote. Relative paths resolve under the remote cwd; use local ls/find for local files.",
 		promptSnippet: "List directories on the active SSH remote",
 		promptGuidelines: ["Use ssh_ls only for remote directory listings. Use local ls/find tools for local workspace exploration."],
 		renderCall(args: any, theme: any, context: any) {
@@ -86,7 +86,7 @@ export function setupFsTools(ssh: SshContext): void {
 		...localFind,
 		name: "ssh_find",
 		label: "ssh_find",
-		description: `Find files on the active SSH remote. Relative paths are resolved under the remote cwd. Use local find for local files. ${localFind.description}`,
+		description: "Find files on the active SSH remote. Relative paths resolve under the remote cwd; use local find/fffind for local files.",
 		promptSnippet: "Find files on the active SSH remote",
 		promptGuidelines: ["Use ssh_find only for remote file discovery. Use local find/fffind for local workspace files."],
 		renderCall(args: any, theme: any, context: any) {
@@ -106,7 +106,7 @@ export function setupFsTools(ssh: SshContext): void {
 		...localGrep,
 		name: "ssh_grep",
 		label: "ssh_grep",
-		description: `Search file contents on the active SSH remote. Relative paths are resolved under the remote cwd. Uses remote rg when available, otherwise grep. Use local grep for local files. ${localGrep.description}`,
+		description: "Search file contents on the active SSH remote. Uses remote rg when available, otherwise grep; use local grep/ffgrep for local files.",
 		promptSnippet: "Search file contents on the active SSH remote",
 		promptGuidelines: ["Use ssh_grep only for remote content search. Use local grep/ffgrep for local workspace files."],
 		renderCall(args: any, theme: any, context: any) {
@@ -130,7 +130,7 @@ export function setupFsTools(ssh: SshContext): void {
 		...localWrite,
 		name: "ssh_write",
 		label: "ssh_write",
-		description: `Write a file on the active SSH remote. Relative paths are resolved under the remote cwd. Use local write for local files. ${localWrite.description}`,
+		description: "Write a file on the active SSH remote. Relative paths resolve under the remote cwd; use local write for local files.",
 		promptSnippet: "Write files on the active SSH remote",
 		promptGuidelines: ["Use ssh_write only for remote files. Use write for local files in the current local workspace."],
 		renderCall(args: any, theme: any, context: any) {
@@ -147,7 +147,7 @@ export function setupFsTools(ssh: SshContext): void {
 	pi.registerTool({
 		name: "ssh_secret_write",
 		label: "ssh_secret_write",
-		description: "Write a secret to a remote file WITHOUT the value passing through the tool-call log. The value is read locally from an environment variable (fromEnv) or a local file (fromFile) and streamed to the remote over stdin; only the name/path and destination are recorded. The remote file is created with mode 0600 by default (created under umask 077 so it is never briefly world-readable). Use this instead of ssh_write/ssh_bash for API keys, tokens, and credentials.",
+		description: "Write a secret to a remote file without logging the value. Reads from a LOCAL env var or file and streams over stdin; use for API keys/tokens/credentials.",
 		promptSnippet: "Write a secret to a remote file without logging its value",
 		promptGuidelines: [
 			"Use ssh_secret_write for API keys/tokens/credentials so the value never enters the tool-call record. Pass the LOCAL env var name (fromEnv) or local file path (fromFile), never the secret literal. Do not paste secrets into ssh_write/ssh_bash.",
@@ -196,7 +196,7 @@ export function setupFsTools(ssh: SshContext): void {
 		...localEdit,
 		name: "ssh_edit",
 		label: "ssh_edit",
-		description: `Edit a file on the active SSH remote. Relative paths are resolved under the remote cwd. Use local edit for local files. ${localEdit.description}`,
+		description: "Edit a file on the active SSH remote. Relative paths resolve under the remote cwd; use local edit for local files.",
 		promptSnippet: "Edit files on the active SSH remote",
 		promptGuidelines: ["Use ssh_edit only for remote files. Use edit for local files in the current local workspace."],
 		renderCall(args: any, theme: any, context: any) {

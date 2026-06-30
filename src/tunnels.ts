@@ -17,6 +17,8 @@ interface TunnelState {
 export interface TunnelManager {
 	/** Cancel every active forward (best-effort) and clear the registry. */
 	stopAll(): void;
+	/** Re-issue every tracked forward (e.g. after a reconnect respawns the master). */
+	restoreAll(): Promise<{ restored: number; failed: number }>;
 	/** Active forwards, for status display (e.g. the /ssh dashboard). */
 	list(): Array<{ localPort: number; remoteHost: string; remotePort: number }>;
 }
@@ -43,12 +45,33 @@ export function createTunnelManager(ctx: SshContext): TunnelManager {
 		tunnels.clear();
 	}
 
+	// Re-issue every tracked forward against the (re)connected master. The master
+	// loses its -L forwards when it dies, so after a reconnect the registry is the
+	// source of truth: cancel any stale forward (best-effort), then forward again.
+	async function restoreAll(): Promise<{ restored: number; failed: number }> {
+		const target = ctx.getTarget();
+		if (!target || tunnels.size === 0) return { restored: 0, failed: 0 };
+		let restored = 0;
+		let failed = 0;
+		for (const tn of tunnels.values()) {
+			await tunnelControl(target, "cancel", tn.spec).catch(() => {});
+			try {
+				const r = await tunnelControl(target, "forward", tn.spec);
+				if (r.code === 0) restored++;
+				else failed++;
+			} catch {
+				failed++;
+			}
+		}
+		return { restored, failed };
+	}
+
 	pi.registerTool({
 		name: "ssh_tunnel",
 		label: "ssh_tunnel",
-		description: "Port-forward a remote port to a local port over the shared SSH connection, so a remote dev server / TensorBoard / Jupyter / web UI is reachable from the local browser at http://localhost:<localPort>. Actions: open | close | list. Tunnels are closed automatically on disconnect.",
+		description: "Forward a remote port to localhost over the shared SSH connection. Actions: open | close | list; tunnels close on disconnect.",
 		promptSnippet: "Forward a remote port to localhost over SSH",
-		promptGuidelines: ["Use ssh_tunnel open to view a remote web UI / dev server / TensorBoard locally; close it with ssh_tunnel close when done."],
+		promptGuidelines: ["Use ssh_tunnel open for remote web UIs/dev servers; close it when done."],
 		parameters: Type.Object({
 			action: Type.Union([Type.Literal("open"), Type.Literal("close"), Type.Literal("list")]),
 			localPort: Type.Optional(Type.Number({ description: "Local port to bind (open/close). Defaults to remotePort." })),
@@ -96,6 +119,7 @@ export function createTunnelManager(ctx: SshContext): TunnelManager {
 
 	return {
 		stopAll,
+		restoreAll,
 		list: () => [...tunnels.values()].map((tn) => ({ localPort: tn.localPort, remoteHost: tn.remoteHost, remotePort: tn.remotePort })),
 	};
 }
