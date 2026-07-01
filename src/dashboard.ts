@@ -406,12 +406,18 @@ Manage:
 
 	// --- runtime connect/disconnect/status ---
 	pi.registerCommand("ssh", {
-		description: "SSH remote dashboard/connect. Subcommands: cd, save, profiles, help monitor, off.",
+		description: "SSH remote dashboard/connect. Subcommands: status, cd, save, profiles, help monitor, off.",
 		handler: async (args, cmdCtx) => {
 			const arg = args.trim();
 
 			if (!arg) {
 				await openSshDashboard(cmdCtx);
+				return;
+			}
+
+			if (arg === "status") {
+				const t = getTarget();
+				cmdCtx.ui.notify(t ? connectedText(t) : "SSH: not connected", "info");
 				return;
 			}
 

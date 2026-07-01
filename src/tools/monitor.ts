@@ -92,19 +92,19 @@ export function setupMonitorTool(ssh: SshContext): void {
 				const gating = source.kind === "probe" ? `notifyWhen ${m.notifyWhen}` : `matching /${m.pattern}/${m.notifyWhen ? ` when ${m.notifyWhen}` : ""}`;
 				return {
 					content: [{ type: "text" as const, text: `Created monitor ${m.id} on ${params.source} ${gating} (notify: ${params.notify?.trim() || "every-match"}). Will notify when it fires.` }],
-					details: { id: m.id, source: params.source, pattern: m.pattern, repeat: m.repeat, notify: params.notify?.trim() || "every-match", notifyWhen: m.notifyWhen },
+					details: { id: m.id, source: params.source, pattern: m.pattern, repeat: m.repeat, notify: params.notify?.trim() || "every-match", notifyWhen: m.notifyWhen } as unknown,
 				};
 			}
 
 			if (params.action === "list") {
-				return { content: [{ type: "text" as const, text: formatRows(monitors.list()) }], details: { count: monitors.list().length } };
+				return { content: [{ type: "text" as const, text: formatRows(monitors.list()) }], details: { count: monitors.list().length } as unknown };
 			}
 
 			if (params.action === "attach") {
 				// Re-scan the monitor store + running jobs' logWatches and re-arm anything
 				// not currently live (e.g. after a manual remove, or to force re-sync).
 				await monitors.rehydrate(t);
-				return { content: [{ type: "text" as const, text: `Re-armed monitors from the remote store.\n${formatRows(monitors.list())}` }], details: { count: monitors.list().length } };
+				return { content: [{ type: "text" as const, text: `Re-armed monitors from the remote store.\n${formatRows(monitors.list())}` }], details: { count: monitors.list().length } as unknown };
 			}
 
 			if (!params.id?.trim()) throw new Error(`ssh_monitor ${params.action} requires id (use ssh_monitor list)`);
@@ -115,22 +115,22 @@ export function setupMonitorTool(ssh: SshContext): void {
 				}
 				const notify = params.notify === undefined ? undefined : parseNotifyPolicy(params.notify);
 				const m = await monitors.update(params.id, { pattern: params.pattern, repeat: params.repeat, name: params.name, notify, template: params.template, notifyWhen: params.notifyWhen, expectEveryMs: params.expectEveryMs });
-				return { content: [{ type: "text" as const, text: `Updated monitor ${m.id}: /${m.pattern}/.` }], details: { id: m.id, pattern: m.pattern, repeat: m.repeat } };
+				return { content: [{ type: "text" as const, text: `Updated monitor ${m.id}: /${m.pattern}/.` }], details: { id: m.id, pattern: m.pattern, repeat: m.repeat } as unknown };
 			}
 
 			if (params.action === "pause") {
 				await monitors.pause(params.id);
-				return { content: [{ type: "text" as const, text: `Paused monitor ${params.id}.` }], details: { id: params.id } };
+				return { content: [{ type: "text" as const, text: `Paused monitor ${params.id}.` }], details: { id: params.id } as unknown };
 			}
 
 			if (params.action === "resume") {
 				await monitors.resume(params.id);
-				return { content: [{ type: "text" as const, text: `Resumed monitor ${params.id}.` }], details: { id: params.id } };
+				return { content: [{ type: "text" as const, text: `Resumed monitor ${params.id}.` }], details: { id: params.id } as unknown };
 			}
 
 			// remove
 			await monitors.remove(params.id);
-			return { content: [{ type: "text" as const, text: `Removed monitor ${params.id}.` }], details: { id: params.id } };
+			return { content: [{ type: "text" as const, text: `Removed monitor ${params.id}.` }], details: { id: params.id } as unknown };
 		},
 	});
 }

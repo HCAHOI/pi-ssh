@@ -158,13 +158,13 @@ export function setupProcessTool(ssh: SshContext): void {
 			if (params.action === "list") {
 				const rows = await listProcesses(t, signal);
 				const text = rows.length ? formatProcRows(rows) : "No remote processes.";
-				return { content: [{ type: "text" as const, text }] };
+				return { content: [{ type: "text" as const, text }], details: undefined };
 			}
 
 			if (params.action === "clear") {
 				const r = await runRemoteCommand(t, buildClearCommand(root), { signal });
 				if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
-				return { content: [{ type: "text" as const, text: r.stdout.toString().trim() }] };
+				return { content: [{ type: "text" as const, text: r.stdout.toString().trim() }], details: undefined };
 			}
 
 			const rowsForNameResolution = params.id?.trim() ? [] : await listProcesses(t, signal);
@@ -175,7 +175,7 @@ export function setupProcessTool(ssh: SshContext): void {
 
 			if (params.action === "attach") {
 				if (poller.has(procId)) {
-					return { content: [{ type: "text" as const, text: `${resolvedNote}Already watching ${procId}.` }] };
+					return { content: [{ type: "text" as const, text: `${resolvedNote}Already watching ${procId}.` }], details: undefined };
 				}
 				const probe = `d=${shQuote(dir)}; if [ ! -d "$d" ]; then echo 'process not found' >&2; exit 2; fi; o=$(wc -c < "$d/stdout.log" 2>/dev/null || echo 0); e=$(wc -c < "$d/stderr.log" 2>/dev/null || echo 0); n=$(base64 < "$d/notify.json" 2>/dev/null | tr -d '\n'); printf '%s\t%s\t%s\n' "$o" "$e" "$n"`;
 				const pr = await runRemoteCommand(t, probe, { signal, login: false });
@@ -223,7 +223,7 @@ export function setupProcessTool(ssh: SshContext): void {
 				if (legacyWatches.length) monitors.armLegacyWatches(t, procId, legacyWatches, { offsets, name });
 				if (userWatches.length) await monitors.createForProcess(t, procId, userWatches, name, offsets);
 				const watching = legacyWatches.length + userWatches.length;
-				return { content: [{ type: "text" as const, text: `${resolvedNote}Watching ${procId} (${name}). Will notify on completion${watching ? " and matching log lines" : ""}.` }] };
+				return { content: [{ type: "text" as const, text: `${resolvedNote}Watching ${procId} (${name}). Will notify on completion${watching ? " and matching log lines" : ""}.` }], details: undefined };
 			}
 
 			if (params.action === "output") {
@@ -247,7 +247,7 @@ export function setupProcessTool(ssh: SshContext): void {
 				const cmd = `d=${shQuote(dir)}; test -d "$d" || { echo 'process not found' >&2; exit 2; }; echo '--- stdout ---'; tail -n ${lines} "$d/stdout.log" 2>/dev/null || true; echo '--- stderr ---'; tail -n ${lines} "$d/stderr.log" 2>/dev/null || true; pid=$(cat "$d/pid" 2>/dev/null || true); if [ -f "$d/exit_code" ]; then echo "--- exited, code: $(cat "$d/exit_code") ---"; elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo "--- still running (pid $pid) ---"; else echo '--- exited (no exit code recorded) ---'; fi`;
 				const r = await runRemoteCommand(t, cmd, { signal });
 				if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
-				return { content: [{ type: "text" as const, text: `${resolvedNote}${r.stdout.toString() || "(no output)"}` }] };
+				return { content: [{ type: "text" as const, text: `${resolvedNote}${r.stdout.toString() || "(no output)"}` }], details: undefined };
 			}
 
 			if (params.action === "logs") {
@@ -261,7 +261,7 @@ export function setupProcessTool(ssh: SshContext): void {
 			monitors.stopForProcess(procId);
 			const r = await runRemoteCommand(t, buildKillCommand(dir), { signal });
 			if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
-			return { content: [{ type: "text" as const, text: `${resolvedNote}${r.stdout.toString().trim()}` }] };
+			return { content: [{ type: "text" as const, text: `${resolvedNote}${r.stdout.toString().trim()}` }], details: undefined };
 		},
 	});
 }

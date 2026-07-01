@@ -49,7 +49,7 @@ export function setupTransferTools(ssh: SshContext): void {
 			);
 			const prefix = params.dryRun ? "[dry-run] " : "";
 			const body = verbose ? (stdout || fallback) : `${summarizeRsync(stdout, fallback)} in ${formatDuration(elapsedMs)}`;
-			return { content: [{ type: "text" as const, text: `${prefix}${body}` }] };
+			return { content: [{ type: "text" as const, text: `${prefix}${body}` }], details: undefined };
 		},
 	});
 
@@ -89,7 +89,7 @@ export function setupTransferTools(ssh: SshContext): void {
 			);
 			const prefix = params.dryRun ? "[dry-run] " : "";
 			const body = verbose ? (stdout || fallback) : `${summarizeRsync(stdout, fallback)} in ${formatDuration(elapsedMs)}`;
-			return { content: [{ type: "text" as const, text: `${prefix}${body}` }] };
+			return { content: [{ type: "text" as const, text: `${prefix}${body}` }], details: undefined };
 		},
 	});
 }

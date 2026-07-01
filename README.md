@@ -25,6 +25,7 @@ enables the efficient in-place `ssh_edit`.
 ```
 /ssh -i /path/key.pem root@host:/abs/work        # connect, set remote cwd
 /ssh root@host                                    # use remote pwd as cwd
+/ssh status                                       # print current connection status
 /ssh cd subdir/or/abs/path                        # move remote cwd (no reconnect)
 /ssh profiles                                     # list saved profiles
 /ssh off                                          # disconnect

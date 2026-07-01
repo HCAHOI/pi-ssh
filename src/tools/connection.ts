@@ -28,7 +28,7 @@ export function setupConnectionTools(ssh: SshContext): void {
 		async execute(_id, params: { target: string }, _signal, _onUpdate, ctx) {
 			const next = await switchTarget(params.target);
 			refreshStatus(ctx);
-			return { content: [{ type: "text" as const, text: connectedText(next) }] };
+			return { content: [{ type: "text" as const, text: connectedText(next) }], details: undefined };
 		},
 	});
 
@@ -44,7 +44,7 @@ export function setupConnectionTools(ssh: SshContext): void {
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
 			await disconnect();
 			refreshStatus(ctx);
-			return { content: [{ type: "text" as const, text: "SSH disconnected. Local tools remain local." }] };
+			return { content: [{ type: "text" as const, text: "SSH disconnected. Local tools remain local." }], details: undefined };
 		},
 	});
 
@@ -61,13 +61,13 @@ export function setupConnectionTools(ssh: SshContext): void {
 		},
 		async execute(_id, params: { verbose?: boolean }) {
 			const t = getTarget();
-			if (!t) return { content: [{ type: "text" as const, text: "SSH: not connected" }] };
-			if (params.verbose) return { content: [{ type: "text" as const, text: await formatSshSitrep(ssh, t) }] };
+			if (!t) return { content: [{ type: "text" as const, text: "SSH: not connected" }], details: undefined };
+			if (params.verbose) return { content: [{ type: "text" as const, text: await formatSshSitrep(ssh, t) }], details: undefined };
 			const base = connectedText(t);
 			let profiles: string[] = [];
 			try { profiles = profileNames(); } catch { /* corrupt profiles file: ignore for status */ }
 			const profileLine = profiles.length ? `\nSaved profiles (reconnect with ssh_connect '@name'): ${profiles.map((n) => `@${n}`).join(", ")}` : "";
-			return { content: [{ type: "text" as const, text: base + profileLine }] };
+			return { content: [{ type: "text" as const, text: base + profileLine }], details: undefined };
 		},
 	});
 }

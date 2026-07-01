@@ -56,10 +56,10 @@ export function setupFsTools(ssh: SshContext): void {
 			return sshTitle("read", `${accentRemotePath(args?.path, theme)}${readLineRange(args, theme)}`, theme, context);
 		},
 		renderResult: localReadDef.renderResult,
-		async execute(id, params, signal, onUpdate, _ctx) {
+		async execute(id, params, signal, onUpdate) {
 			const t = requireTarget();
 			const tool = createReadTool(localCwd, { operations: createRemoteReadOps(t, localCwd) });
-			return withReconnect(() => tool.execute(id, params, signal, onUpdate, _ctx));
+			return withReconnect(() => tool.execute(id, params, signal, onUpdate));
 		},
 	});
 
@@ -74,10 +74,10 @@ export function setupFsTools(ssh: SshContext): void {
 		renderCall(args: any, theme: any, context: any) {
 			return sshTitle("ls", accentRemotePath(args?.path, theme), theme, context);
 		},
-		async execute(id, params, signal, onUpdate, _ctx) {
+		async execute(id, params, signal, onUpdate) {
 			const t = requireTarget();
 			const tool = createLsTool(localCwd, { operations: createRemoteLsOps(t, localCwd) });
-			return withReconnect(() => tool.execute(id, params, signal, onUpdate, _ctx));
+			return withReconnect(() => tool.execute(id, params, signal, onUpdate));
 		},
 	});
 
@@ -94,10 +94,10 @@ export function setupFsTools(ssh: SshContext): void {
 			const where = args?.path ? ` ${theme.fg("muted", `in ${remoteDisplayPath(str(args.path))}`)}` : "";
 			return sshTitle("find", `${pat}${where}`, theme, context);
 		},
-		async execute(id, params, signal, onUpdate, _ctx) {
+		async execute(id, params, signal, onUpdate) {
 			const t = requireTarget();
 			const tool = createFindTool(localCwd, { operations: createRemoteFindOps(t, localCwd) });
-			return withReconnect(() => tool.execute(id, params, signal, onUpdate, _ctx));
+			return withReconnect(() => tool.execute(id, params, signal, onUpdate));
 		},
 	});
 
@@ -136,10 +136,10 @@ export function setupFsTools(ssh: SshContext): void {
 		renderCall(args: any, theme: any, context: any) {
 			return sshTitle("write", accentRemotePath(args?.path, theme), theme, context);
 		},
-		async execute(id, params, signal, onUpdate, _ctx) {
+		async execute(id, params, signal, onUpdate) {
 			const t = requireTarget();
 			const tool = createWriteTool(localCwd, { operations: createRemoteWriteOps(t, localCwd) });
-			return withReconnect(() => tool.execute(id, params, signal, onUpdate, _ctx));
+			return withReconnect(() => tool.execute(id, params, signal, onUpdate));
 		},
 	});
 
@@ -187,7 +187,7 @@ export function setupFsTools(ssh: SshContext): void {
 			const cmd = `mkdir -p -- "$(dirname ${q})" && ( umask 077 && cat > ${q} ) && chmod ${mode} ${q}`;
 			const r = await withReconnect(() => withFileLock(`${t.remote}:${remotePath}`, () => runRemoteCommand(t, cmd, { stdin: value })));
 			if (r.code !== 0) throw new Error(`${sshFailureMessage(r)}: ${r.stderr.toString().trim() || r.stdout.toString().trim()}`);
-			return { content: [{ type: "text" as const, text: `Wrote secret (${value.length} bytes) to ${t.remote}:${remotePath} (mode ${mode}). Value not recorded.` }] };
+			return { content: [{ type: "text" as const, text: `Wrote secret (${value.length} bytes) to ${t.remote}:${remotePath} (mode ${mode}). Value not recorded.` }], details: undefined };
 		},
 	});
 
@@ -207,7 +207,7 @@ export function setupFsTools(ssh: SshContext): void {
 		renderResult(result: any, _options: any, theme: any, context: any) {
 			return renderEditDiffResult(result, theme, context);
 		},
-		async execute(id, params: { path: string; edits: Array<{ oldText: string; newText: string }> }, signal, onUpdate, _ctx) {
+		async execute(id, params: { path: string; edits: Array<{ oldText: string; newText: string }> }, signal, onUpdate) {
 			const t = requireTarget();
 			const remotePath = toRemotePath(params.path, localCwd, t.remoteCwd);
 
@@ -234,7 +234,7 @@ export function setupFsTools(ssh: SshContext): void {
 
 			// Fallback: read-rewrite-write via the edit tool's own diff engine.
 			const tool = createEditTool(localCwd, { operations: createRemoteEditOps(t, localCwd, false) });
-			return withReconnect(() => withFileLock(`${t.remote}:${remotePath}`, () => tool.execute(id, params, signal, onUpdate, _ctx)));
+			return withReconnect(() => withFileLock(`${t.remote}:${remotePath}`, () => tool.execute(id, params, signal, onUpdate)));
 		},
 	});
 }

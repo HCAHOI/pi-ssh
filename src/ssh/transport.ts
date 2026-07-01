@@ -24,8 +24,8 @@ export function runSsh(args: string[], opts?: RunOptions): Promise<RunResult> {
 		const err: Buffer[] = [];
 		let settled = false;
 		let timedOut = false;
-		child.stdout.on("data", (d) => out.push(d));
-		child.stderr.on("data", (d) => err.push(d));
+		child.stdout!.on("data", (d) => out.push(d));
+		child.stderr!.on("data", (d) => err.push(d));
 		let timer: NodeJS.Timeout | undefined;
 		if (opts?.timeout) {
 			timer = setTimeout(() => {
@@ -50,14 +50,14 @@ export function runSsh(args: string[], opts?: RunOptions): Promise<RunResult> {
 			resolve({ code, signal: closeSignal, stdout: Buffer.concat(out), stderr: Buffer.concat(err), timedOut });
 		});
 		if (opts?.stdin !== undefined) {
-			child.stdin.on("error", (e) => {
+			child.stdin!.on("error", (e) => {
 				if (settled) return;
 				settled = true;
 				if (timer) clearTimeout(timer);
 				opts?.signal?.removeEventListener("abort", onAbort);
 				reject(e);
 			});
-			child.stdin.end(opts.stdin);
+			child.stdin!.end(opts.stdin);
 		}
 	});
 }

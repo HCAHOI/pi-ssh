@@ -72,7 +72,6 @@ export function setupBashTool(ssh: SshContext): void {
 					{ command: buildSshBashCommand(t, params), timeout: params.timeout },
 					signal,
 					onUpdate,
-					_ctx,
 				);
 				if (params.verbose) return result;
 				// Collapse routine apt/pip/npm/docker progress noise in the text blocks,

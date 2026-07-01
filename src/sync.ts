@@ -120,17 +120,17 @@ export function createSyncManager(ctx: SshContext): SyncManager {
 		async execute(_id, params: { action: "start" | "stop" | "status"; localPath?: string; remotePath?: string; debounceMs?: number; delete?: boolean; excludes?: string[] }) {
 			const t = requireTarget();
 			if (params.action === "status") {
-				if (!syncState) return { content: [{ type: "text" as const, text: "ssh_sync: not running." }] };
-				return { content: [{ type: "text" as const, text: `ssh_sync: watching ${syncState.localSource} -> ${syncState.remote}:${syncState.remoteDest} (${syncState.count} syncs so far)` }] };
+				if (!syncState) return { content: [{ type: "text" as const, text: "ssh_sync: not running." }], details: undefined };
+				return { content: [{ type: "text" as const, text: `ssh_sync: watching ${syncState.localSource} -> ${syncState.remote}:${syncState.remoteDest} (${syncState.count} syncs so far)` }], details: undefined };
 			}
 			if (params.action === "stop") {
 				const was = syncState ? `${syncState.count}` : null;
 				stop();
-				return { content: [{ type: "text" as const, text: was === null ? "ssh_sync was not running." : `ssh_sync stopped (${was} syncs).` }] };
+				return { content: [{ type: "text" as const, text: was === null ? "ssh_sync was not running." : `ssh_sync stopped (${was} syncs).` }], details: undefined };
 			}
 			// start
 			const { localSource, remoteDest, debounceMs, initialTail } = await startSync(t, params);
-			return { content: [{ type: "text" as const, text: `ssh_sync started: ${localSource} -> ${t.remote}:${remoteDest} (debounce ${debounceMs}ms).\n${initialTail}` }] };
+			return { content: [{ type: "text" as const, text: `ssh_sync started: ${localSource} -> ${t.remote}:${remoteDest} (debounce ${debounceMs}ms).\n${initialTail}` }], details: undefined };
 		},
 	});
 
